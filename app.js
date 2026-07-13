@@ -1110,7 +1110,6 @@ function updateRecordUI(isRecording) {
 function renderResults(session) {
   renderStats(session.stats);
   renderChart(session.results);
-  renderTable(session.results);
   renderComparison();
 }
 
@@ -1166,10 +1165,23 @@ function renderStats(stats) {
 /* ── SVG-График джиттера ────────────────────────────────── */
 function renderChart(results) {
   const container = el('chart-container');
+  if (!container) return;
   if (!results || results.length === 0) {
     container.innerHTML = '<p class="empty-msg">Нет данных для графика</p>';
     return;
   }
+  container.innerHTML = buildChartSVG(results);
+}
+
+/**
+ * buildChartSVG — строит SVG-график джиттера и возвращает его строкой.
+ * Вынесено отдельно, чтобы один и тот же график можно было и вставить
+ * на экран (renderChart), и встроить в автономный HTML-отчёт.
+ * @param {Array} results
+ * @returns {string} SVG-разметка
+ */
+function buildChartSVG(results) {
+  if (!results || results.length === 0) return '<p class="empty-msg">Нет данных для графика</p>';
 
   const W  = 800, H  = 400;
   const mT = 30, mR = 20, mB = 55, mL = 68;
@@ -1287,31 +1299,7 @@ function renderChart(results) {
       </g>
     </svg>`;
 
-  container.innerHTML = svgStr;
-}
-
-/* ── Таблица детализации ─────────────────────────────────── */
-function renderTable(results) {
-  const tbody = el('beats-tbody');
-  if (!results || results.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="4" class="empty-msg">Нет данных</td></tr>';
-    return;
-  }
-
-  tbody.innerHTML = results.map(r => {
-    const abs  = Math.abs(r.jitterMs);
-    const sign = r.jitterMs >= 0 ? '+' : '';
-    const cls  = abs < 20 ? 'row-green' : abs < 50 ? 'row-yellow' : 'row-red';
-    const badge = abs < 20 ? '🏆 Элита' : abs < 50 ? '✅ Хорошо' : abs < 100 ? '📊 Норма' : '⚠️ Слабо';
-    const metSec = (r.metronomeTimeMs / 1000).toFixed(2);
-
-    return `<tr class="${cls}">
-      <td>${r.beatNum}</td>
-      <td>${metSec}</td>
-      <td class="jitter-val">${sign}${r.jitterMs} мс</td>
-      <td>${badge}</td>
-    </tr>`;
-  }).join('');
+  return svgStr;
 }
 
 /* ── Блок сравнения ДО / ПОСЛЕ ──────────────────────────── */
@@ -1405,9 +1393,15 @@ function renderHistory() {
           ${renderHistoryDetail(s)}
           <div class="hi-actions">
             <button class="btn btn-sm btn-share" onclick="shareSession(${idx})">📤 Поделиться</button>
+            <button class="btn btn-sm btn-html"  onclick="exportSessionHTML(${idx})">📊 HTML</button>
             <button class="btn btn-sm btn-csv"   onclick="exportSessionCSV(${idx})">📄 CSV</button>
             <button class="btn btn-sm btn-json"  onclick="exportSessionJSON(${idx})">🗂️ JSON</button>
             <button class="btn btn-sm btn-danger" onclick="deleteHistoryItem(${idx})">🗑️</button>
+          </div>
+          <div class="hi-actions" style="margin-top:6px">
+            <span style="font-size:11px;color:var(--text-muted);align-self:center">Для сравнения:</span>
+            <button class="btn btn-sm btn-before" onclick="assignSession(${idx},'before')">⬅ как «ДО»</button>
+            <button class="btn btn-sm btn-after"  onclick="assignSession(${idx},'after')">как «ПОСЛЕ» ➡</button>
           </div>
         </div>
       </div>`;
@@ -1528,6 +1522,195 @@ function getExportFilename(session, ext) {
   return `jitter_${name}_${date}.${ext}`;
 }
 
+// ============================================================
+// 9b. АВТОНОМНЫЙ HTML-ОТЧЁТ (просмотр + повторный импорт)
+// ============================================================
+//
+// Ключевая идея «два в одном»:
+//  • Файл открывается в ЛЮБОМ браузере → специалист сразу видит график,
+//    итоговую статистику и профиль (всё отрисовано и стилизовано инлайн).
+//  • Внутри того же файла спрятан <script id="jitter-session-data"> с полным
+//    JSON сессии → приложение может загрузить файл обратно и восстановить
+//    сессию как родную (история, сравнение ДО/ПОСЛЕ).
+// Никаких внешних зависимостей — полностью оффлайн и самодостаточно.
+
+const REPORT_MARKER = 'jitter-session-data'; // id script-тега с данными
+const REPORT_SCHEMA = 1;                      // версия формата отчёта
+
+/** Экранирование текста для безопасной вставки в HTML. */
+function escHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/** Строит строки итоговой статистики для отчёта. */
+function reportStatsHTML(st) {
+  if (!st) return '<p>Нет статистики</p>';
+  const lvl = st.level || { label: '—', color: '#94a3b8', desc: '' };
+  const shift = (st.meanSigned > 0 ? '+' : '') + st.meanSigned;
+  const shiftDesc = st.meanSigned > 0 ? 'запаздывание' : st.meanSigned < 0 ? 'опережение' : 'без сдвига';
+  const cards = [
+    ['Уровень', `<span style="color:${lvl.color}">${escHtml(lvl.label)}</span>`, escHtml(lvl.desc || '')],
+    ['MAD (среднее отклонение)', `${st.mad} мс`, 'Основная метрика точности'],
+    ['Систематический сдвиг', `${shift} мс`, shiftDesc],
+    ['Стандартное отклонение', `±${st.stdDev} мс`, 'Разброс результатов'],
+    ['Попадания &lt;20 мс', `${st.percentUnder20}%`, `${Math.round(st.count * st.percentUnder20 / 100)} из ${st.count}`],
+    ['Попадания &lt;50 мс', `${st.percentUnder50}%`, 'Хороший диапазон'],
+    ['Диапазон', `${st.minAbs}–${st.maxAbs} мс`, 'Мин–макс |отклонения|'],
+    ['Всего ударов', `${st.count}`, 'Обнаружено пар'],
+  ];
+  return cards.map(([l, v, s]) => `
+    <div class="rc">
+      <div class="rl">${l}</div>
+      <div class="rv">${v}</div>
+      <div class="rs">${s}</div>
+    </div>`).join('');
+}
+
+/** Строит таблицу детализации по ударам (только для файла отчёта). */
+function reportTableHTML(results) {
+  const rows = (results || []).map(r => {
+    const abs  = Math.abs(r.jitterMs);
+    const sign = r.jitterMs >= 0 ? '+' : '';
+    const grade = abs < 20 ? '🏆 Элита' : abs < 50 ? '✅ Хорошо' : abs < 100 ? '📊 Норма' : '⚠️ Слабо';
+    const col  = abs < 20 ? '#22c55e' : abs < 50 ? '#eab308' : '#ef4444';
+    return `<tr>
+      <td>${r.beatNum}</td>
+      <td>${(r.metronomeTimeMs / 1000).toFixed(2)}</td>
+      <td style="color:${col};font-weight:600">${sign}${r.jitterMs} мс</td>
+      <td>${grade}</td>
+    </tr>`;
+  }).join('');
+  return rows || '<tr><td colspan="4">Нет данных</td></tr>';
+}
+
+/**
+ * sessionToStandaloneHTML — собирает автономный HTML-отчёт со встроенными данными.
+ * @param {object} session
+ * @returns {string} полный HTML-документ
+ */
+function sessionToStandaloneHTML(session) {
+  const pf = session.profile || {};
+  const st = session.stats || {};
+  const dt = formatDate(session.timestamp);
+  const chart = buildChartSVG(session.results || []);
+
+  // Полезная нагрузка: обёртка со схемой + сама сессия.
+  const payload = { schema: REPORT_SCHEMA, app: 'jitter-test', exportedAt: new Date().toISOString(), session };
+  // Экранируем '<' чтобы JSON не «разорвал» script-тег.
+  const jsonStr = JSON.stringify(payload).replace(/</g, '\\u003c');
+
+  const profileLine = pf.name || pf.age || pf.gender || pf.email
+    ? `${escHtml(pf.name || '—')} · ${escHtml(pf.age || '—')} лет · ${escHtml(pf.gender || '—')}${pf.email ? ' · ' + escHtml(pf.email) : ''}`
+    : 'Профиль не указан';
+
+  return `<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Джиттер-тест — отчёт (${escHtml(pf.name || 'без имени')}, ${escHtml(dt)})</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px; background: #0d0d1a; color: #e2e8f0;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.5; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 28px 0 12px; color: #a5b4fc; border-bottom: 1px solid #2a2d4e; padding-bottom: 6px; }
+  .sub { color: #94a3b8; font-size: 13px; margin: 0 0 4px; }
+  .card { background: #16172e; border: 1px solid #24264a; border-radius: 12px; padding: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+  .rc { background: #11122a; border: 1px solid #24264a; border-radius: 8px; padding: 10px 12px; }
+  .rl { font-size: 11px; color: #94a3b8; }
+  .rv { font-size: 20px; font-weight: 700; margin: 2px 0; }
+  .rs { font-size: 11px; color: #64748b; }
+  .legend { margin-top: 10px; font-size: 12px; color: #94a3b8; }
+  .legend span { margin-right: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #24264a; }
+  th { color: #94a3b8; font-weight: 600; position: sticky; top: 0; background: #16172e; }
+  .tbl-wrap { max-height: 460px; overflow-y: auto; border: 1px solid #24264a; border-radius: 8px; }
+  .note { font-size: 12px; color: #64748b; margin-top: 8px; }
+  .banner { background: #12283f; border: 1px solid #0369a1; color: #7dd3fc; border-radius: 10px;
+            padding: 10px 14px; font-size: 13px; margin: 14px 0; }
+  footer { margin-top: 26px; font-size: 12px; color: #475569; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🥁 Джиттер-тест — отчёт</h1>
+  <p class="sub"><b>Дата замера:</b> ${escHtml(dt)}</p>
+  <p class="sub"><b>Профиль:</b> ${profileLine}</p>
+  ${session.type ? `<p class="sub"><b>Тип:</b> ${escHtml(session.type)}</p>` : ''}
+
+  <div class="banner">
+    💡 Этот файл можно открыть в браузере для просмотра, а также загрузить обратно
+    в приложение «Джиттер-тест» (вкладка «История» → «Загрузить отчёт») — данные восстановятся полностью.
+  </div>
+
+  <h2>📊 Итоговая статистика</h2>
+  <div class="grid">${reportStatsHTML(st)}</div>
+
+  <h2>📈 График джиттера по ударам</h2>
+  <div class="card">
+    ${chart}
+    <div class="legend">
+      <span style="color:#22c55e">● &lt;20 мс — элита</span>
+      <span style="color:#eab308">● 20–50 мс — хорошо</span>
+      <span style="color:#ef4444">● &gt;50 мс — норма/слабо</span>
+    </div>
+    <div class="note">Нулевая линия = метроном. Точки выше нуля — запаздывание, ниже — опережение.</div>
+  </div>
+
+  <h2>📋 Детализация по ударам</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Время метр. (с)</th><th>Отклонение</th><th>Оценка</th></tr></thead>
+      <tbody>${reportTableHTML(session.results)}</tbody>
+    </table>
+  </div>
+
+  <footer>Сформировано приложением «Джиттер-тест» · Сенсомоторный ритм</footer>
+</div>
+
+<!-- ⬇ ВСТРОЕННЫЕ ДАННЫЕ СЕССИИ (для повторного импорта в приложение) -->
+<script type="application/json" id="${REPORT_MARKER}">
+${jsonStr}
+</script>
+</body>
+</html>`;
+}
+
+/** Валидирует, что объект похож на сессию джиттер-теста. */
+function isValidSession(s) {
+  return s && typeof s === 'object' && Array.isArray(s.results) && s.results.length > 0 &&
+         s.results.every(r => typeof r.jitterMs === 'number');
+}
+
+/** Извлекает сессию из строки HTML-отчёта или JSON. */
+function parseReportContent(text) {
+  // 1) Пытаемся как автономный HTML-отчёт (ищем встроенный script).
+  try {
+    const doc = new DOMParser().parseFromString(text, 'text/html');
+    const node = doc.getElementById(REPORT_MARKER);
+    if (node && node.textContent.trim()) {
+      const payload = JSON.parse(node.textContent);
+      const sess = payload && payload.session ? payload.session : payload;
+      if (isValidSession(sess)) return sess;
+    }
+  } catch (e) { /* не HTML или нет данных — пробуем дальше */ }
+
+  // 2) Пытаемся как «сырой» JSON (наш JSON-экспорт или payload-обёртка).
+  try {
+    const obj = JSON.parse(text);
+    const sess = obj && obj.session ? obj.session : obj;
+    if (isValidSession(sess)) return sess;
+  } catch (e) { /* не JSON */ }
+
+  return null;
+}
+
 /* Текущая сессия */
 function exportCurrentCSV() {
   if (!state.currentSession) { toast('Сначала сделайте запись', 'error'); return; }
@@ -1538,6 +1721,12 @@ function exportCurrentJSON() {
   if (!state.currentSession) { toast('Сначала сделайте запись', 'error'); return; }
   downloadFile(JSON.stringify(state.currentSession, null, 2),
                getExportFilename(state.currentSession, 'json'), 'application/json');
+}
+function exportCurrentHTML() {
+  if (!state.currentSession) { toast('Сначала сделайте запись', 'error'); return; }
+  downloadFile(sessionToStandaloneHTML(state.currentSession),
+               getExportFilename(state.currentSession, 'html'), 'text/html;charset=utf-8');
+  toast('HTML-отчёт сохранён ✓', 'success');
 }
 
 /* Из истории */
@@ -1551,25 +1740,33 @@ window.exportSessionJSON = function(idx) {
   if (!s) return;
   downloadFile(JSON.stringify(s, null, 2), getExportFilename(s, 'json'), 'application/json');
 };
+window.exportSessionHTML = function(idx) {
+  const s = loadHistory()[idx];
+  if (!s) return;
+  downloadFile(sessionToStandaloneHTML(s), getExportFilename(s, 'html'), 'text/html;charset=utf-8');
+  toast('HTML-отчёт сохранён ✓', 'success');
+};
 
-/* Поделиться (текущая сессия или из истории) */
+/* Поделиться (текущая сессия или из истории) — отправляем HTML-отчёт */
 async function shareSessionData(session) {
   if (!session) { toast('Нет данных для отправки', 'error'); return; }
 
   const text = sessionToText(session);
-  const csvBlob = new Blob([sessionToCSV(session)], { type: 'text/csv' });
-  const csvFile = new File([csvBlob], getExportFilename(session, 'csv'), { type: 'text/csv' });
+  const htmlBlob = new Blob([sessionToStandaloneHTML(session)], { type: 'text/html' });
+  const htmlFile = new File([htmlBlob], getExportFilename(session, 'html'), { type: 'text/html' });
 
   // Web Share API (нативный диалог на мобильных)
   if (navigator.share) {
     const shareData = {
-      title:   'Джиттер-тест: результаты',
-      text:    text.slice(0, 2000), // лимит Web Share
+      title:   'Джиттер-тест: отчёт',
+      text:    `Джиттер-тест: MAD ${session.stats?.mad} мс, уровень ${session.stats?.level?.label || '—'}. Отчёт (график + статистика) во вложении — откройте в браузере.`,
     };
 
-    // Пробуем прикрепить файл (не все браузеры поддерживают)
-    if (navigator.canShare && navigator.canShare({ files: [csvFile] })) {
-      shareData.files = [csvFile];
+    // Пробуем прикрепить HTML-отчёт (не все браузеры поддерживают файлы)
+    if (navigator.canShare && navigator.canShare({ files: [htmlFile] })) {
+      shareData.files = [htmlFile];
+    } else {
+      shareData.text = text.slice(0, 2000);
     }
 
     try {
@@ -1603,6 +1800,58 @@ function showShareMenu(session, text) {
 window.shareSession = async function(idx) {
   const s = loadHistory()[idx];
   if (s) await shareSessionData(s);
+};
+
+// ── Импорт отчёта (HTML или JSON) обратно в приложение ──
+async function importReportFromFile(file) {
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const session = parseReportContent(text);
+
+    if (!session) {
+      toast('Не удалось распознать отчёт. Нужен HTML-отчёт или JSON из этого приложения.', 'error');
+      return;
+    }
+
+    // Восстанавливаем недостающие поля, помечаем как импортированную.
+    if (!session.stats) session.stats = computeStats(session.results);
+    if (!session.timestamp) session.timestamp = new Date().toISOString();
+    session.id = Date.now();
+    session.imported = true;
+
+    // Не создаём дубликат: если такая же сессия уже есть — сообщаем.
+    const hist = loadHistory();
+    const dup = hist.find(h =>
+      h.timestamp === session.timestamp &&
+      h.results?.length === session.results.length &&
+      (h.stats?.mad === session.stats?.mad));
+    if (dup) {
+      toast('Этот отчёт уже есть в истории', 'info');
+      switchTab('history');
+      return;
+    }
+
+    addToHistory(session);
+    renderHistory();
+    switchTab('history');
+
+    const pname = session.profile?.name || 'без имени';
+    toast(`Отчёт загружен: ${pname}, MAD ${session.stats?.mad} мс ✓`, 'success');
+  } catch (e) {
+    toast('Ошибка чтения файла: ' + e.message, 'error');
+    console.error(e);
+  }
+}
+
+// ── Назначить сессию из истории эталоном сравнения (ДО / ПОСЛЕ) ──
+window.assignSession = function(idx, slot) {
+  const s = loadHistory()[idx];
+  if (!s) return;
+  storage.set(slot === 'before' ? SK.BEFORE : SK.AFTER, s);
+  toast(`Сессия назначена как «${slot === 'before' ? 'ДО' : 'ПОСЛЕ'}» ✓`, 'success');
+  renderComparison();
+  switchTab('record');
 };
 
 // ============================================================
@@ -1780,12 +2029,26 @@ document.addEventListener('DOMContentLoaded', () => {
   // ── Экспорт ──
   el('export-csv-btn').addEventListener('click', exportCurrentCSV);
   el('export-json-btn').addEventListener('click', exportCurrentJSON);
+  el('export-html-btn').addEventListener('click', exportCurrentHTML);
 
   // ── Поделиться ──
   el('share-btn').addEventListener('click', () => shareSessionData(state.currentSession));
 
+  el('share-menu-html').addEventListener('click', exportCurrentHTML);
   el('share-menu-csv').addEventListener('click', exportCurrentCSV);
   el('share-menu-json').addEventListener('click', exportCurrentJSON);
+
+  // ── Импорт отчёта (вкладка «История») ──
+  const importBtn   = el('import-report-btn');
+  const importInput = el('import-report-input');
+  if (importBtn && importInput) {
+    importBtn.addEventListener('click', () => importInput.click());
+    importInput.addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
+      await importReportFromFile(file);
+      importInput.value = ''; // сброс, чтобы можно было выбрать тот же файл повторно
+    });
+  }
 
   // ── Очистить историю ──
   el('clear-history-btn').addEventListener('click', () => {
