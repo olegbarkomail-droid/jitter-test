@@ -360,6 +360,151 @@
       line-height: 1.5;
     }
 
+    /* ── Калибровка порогов (живой VU-метр) ──────────── */
+    .calib-card { }
+    .calib-layout {
+      display: flex;
+      gap: 20px;
+      align-items: stretch;
+      margin-top: 8px;
+    }
+    /* Вертикальный столб уровня */
+    .calib-meter {
+      position: relative;
+      width: 74px;
+      height: 300px;
+      flex-shrink: 0;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      overflow: visible;
+      user-select: none;
+      touch-action: none;
+    }
+    /* Цветные зоны (задаются через градиент из JS) */
+    .calib-zones {
+      position: absolute;
+      inset: 0;
+      border-radius: 9px;
+      opacity: 0.28;
+      pointer-events: none;
+    }
+    /* Текущий уровень — заливка снизу */
+    .calib-fill {
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      height: 0%;
+      background: linear-gradient(to top, var(--accent-h), #c7d2fe);
+      border-radius: 0 0 9px 9px;
+      pointer-events: none;
+      transition: height .04s linear;
+    }
+    /* Пиковая метка (peak-hold) */
+    .calib-peak {
+      position: absolute;
+      left: -4px; right: -4px;
+      height: 3px;
+      bottom: 0%;
+      background: #fff;
+      box-shadow: 0 0 6px rgba(255,255,255,0.8);
+      pointer-events: none;
+      border-radius: 2px;
+    }
+    /* Перетаскиваемые ползунки порогов */
+    .calib-handle {
+      position: absolute;
+      left: -10px; right: -10px;
+      height: 0;
+      cursor: ns-resize;
+      z-index: 3;
+      touch-action: none;
+    }
+    .calib-handle .hline {
+      position: absolute;
+      left: 0; right: 0; top: -1.5px;
+      height: 3px;
+      border-radius: 2px;
+    }
+    .calib-handle .htag {
+      position: absolute;
+      top: -12px;
+      padding: 1px 6px;
+      font-size: 11px;
+      font-weight: 700;
+      border-radius: 6px;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+      color: #fff;
+    }
+    .calib-handle.metro .hline, .calib-handle.metro .htag { background: var(--red); }
+    .calib-handle.metro .htag { right: -2px; }
+    .calib-handle.stick .hline, .calib-handle.stick .htag { background: var(--yellow); color:#1a1300; }
+    .calib-handle.stick .htag { left: -2px; }
+    .calib-handle .hline::after {
+      content: '';
+      position: absolute;
+      right: -2px; top: 50%;
+      width: 12px; height: 12px;
+      transform: translateY(-50%);
+      border-radius: 50%;
+      background: inherit;
+    }
+    .calib-handle.stick .hline::after { right: auto; left: -2px; }
+
+    /* Правая колонка: подписи зон + управление */
+    .calib-side {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .calib-legend { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+    .calib-legend .lg { display: flex; align-items: center; gap: 8px; color: var(--text-dim); }
+    .calib-legend .sw { width: 14px; height: 14px; border-radius: 4px; flex-shrink: 0; }
+    .calib-legend .sw.red { background: var(--red); }
+    .calib-legend .sw.yellow { background: var(--yellow); }
+    .calib-legend .sw.gray { background: var(--text-muted); }
+    .calib-legend b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+    .calib-live-val {
+      font-size: 13px;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .calib-live-val b { color: var(--accent-h); font-size: 20px; }
+
+    .calib-buttons { display: flex; flex-direction: column; gap: 8px; margin-top: auto; }
+    .btn-calib {
+      background: var(--card2);
+      color: var(--accent-h);
+      border: 1px solid var(--border);
+      width: 100%;
+    }
+    .btn-calib:hover { background: var(--surface); border-color: var(--accent); }
+    .btn-calib.active { background: var(--accent); color: #fff; border-color: var(--accent-h); }
+    .btn-auto {
+      background: linear-gradient(135deg, var(--yellow), #f59e0b);
+      color: #1a1300;
+      border: none;
+      width: 100%;
+      font-weight: 700;
+    }
+    .btn-auto:hover { filter: brightness(1.08); }
+    .btn-auto:disabled { opacity: .4; cursor: not-allowed; filter: none; }
+    .calib-hint {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 10px;
+      line-height: 1.5;
+    }
+    .calib-auto-status {
+      font-size: 12px;
+      color: var(--yellow);
+      min-height: 16px;
+      margin-top: 2px;
+      font-weight: 600;
+    }
+
     /* ── Запись: блок статуса ─────────────────────────── */
     .record-card { text-align: center; }
     #record-status {
@@ -770,6 +915,50 @@
             Окно ±мс вокруг удара метронома
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- Калибровка порогов -->
+    <div class="card calib-card">
+      <h3>🎚️ Калибровка порогов</h3>
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:4px;line-height:1.5">
+        Включите настройку, постучите палочкой в такт метроному и двигайте
+        цветные ползунки: 🔴 чуть ниже пиков метронома, 🟡 между шумом и ударами палочки.
+        Или нажмите «Авто-калибровка» — приложение подберёт пороги само.
+      </div>
+      <div class="calib-layout">
+        <!-- Вертикальный столб уровня -->
+        <div class="calib-meter" id="calib-meter">
+          <div class="calib-zones" id="calib-zones"></div>
+          <div class="calib-fill"  id="calib-fill"></div>
+          <div class="calib-peak"  id="calib-peak"></div>
+          <div class="calib-handle metro" id="calib-handle-metro">
+            <div class="hline"></div>
+            <div class="htag" id="calib-tag-metro">0.50</div>
+          </div>
+          <div class="calib-handle stick" id="calib-handle-stick">
+            <div class="hline"></div>
+            <div class="htag" id="calib-tag-stick">0.12</div>
+          </div>
+        </div>
+        <!-- Правая колонка -->
+        <div class="calib-side">
+          <div class="calib-legend">
+            <div class="lg"><span class="sw red"></span>Метроном &nbsp;≥&nbsp;<b id="calib-legend-metro">0.50</b></div>
+            <div class="lg"><span class="sw yellow"></span>Палочка &nbsp;<b id="calib-legend-stick">0.12</b>–<b id="calib-legend-metro2">0.50</b></div>
+            <div class="lg"><span class="sw gray"></span>Шум / тишина &nbsp;&lt;&nbsp;<b id="calib-legend-noise">0.12</b></div>
+          </div>
+          <div class="calib-live-val">Уровень: <b id="calib-live">0.00</b></div>
+          <div class="calib-auto-status" id="calib-auto-status"></div>
+          <div class="calib-buttons">
+            <button class="btn btn-auto" id="calib-auto-btn">✨ Авто-калибровка</button>
+            <button class="btn btn-calib" id="calib-btn">🎧 Начать настройку</button>
+          </div>
+        </div>
+      </div>
+      <div class="calib-hint">
+        Пороги общие с параметрами анализа выше — изменения сохраняются автоматически.
+        Настройку нужно остановить перед записью.
       </div>
     </div>
 
