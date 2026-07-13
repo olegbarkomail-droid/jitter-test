@@ -550,11 +550,378 @@ function flashBeat() {
 }
 
 // ============================================================
+// 5c. КАЛИБРОВКА ПОРОГОВ — живой VU-метр + авто-подбор
+// ============================================================
+//
+// Самая сложная часть работы с сырым звуком — «поймать» пороги: где
+// заканчивается шум, где удары палочки, а где громкие щелчки метронома.
+// Этот блок даёт визуальный помощник:
+//
+//   • Живой вертикальный столб уровня (VU-метр). Он показывает ту же
+//     величину, что используется в анализе — сглаженную огибающую |x|
+//     (окно ~2 мс), поэтому высота пиков в метре напрямую соответствует
+//     порогам METRONOME_THRESHOLD / STICK_THRESHOLD (шкала 0…1).
+//   • Два перетаскиваемых ползунка: 🔴 метроном, 🟡 палочка. Тянем прямо
+//     на столбе — пороги применяются и сохраняются на лету, слайдеры выше
+//     синхронизируются.
+//   • Авто-калибровка: ~9 сек слушаем метроном + удары, ловим дискретные
+//     события, кластеризуем их амплитуды на 2 группы (палочка/метроном)
+//     методом k-средних и предлагаем пороги автоматически.
+
+const METER_MAX = 1.0; // верх шкалы = уровень 1.0 (совпадает с диапазоном порогов)
+
+const calib = {
+  active:      false,
+  stream:      null,
+  ctx:         null,
+  analyser:    null,
+  buf:         null,
+  raf:         null,
+  smoothWin:   1,
+  level:       0,     // отображаемый уровень (быстрая атака, медленный спад)
+  peakHold:    0,
+  // авто-режим
+  auto:        false,
+  autoEndT:    0,
+  autoDur:     9000,  // мс сбора данных
+  floorSamples:[],    // оценка шумового пола (первые ~800 мс)
+  floorUntil:  0,
+  noiseFloor:  0.01,
+  inEvent:     false,
+  curEventPeak:0,
+  lastEventT:  0,
+  events:      [],    // амплитуды обнаруженных ударов
+  dragging:    null,  // 'metro' | 'stick' | null
+};
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+/** Пересчитывает позиции ползунков, зон и подписей по текущим порогам. */
+function syncCalibHandles() {
+  const metro = clamp(state.config.METRONOME_THRESHOLD, 0.10, 0.95);
+  const stick = clamp(state.config.STICK_THRESHOLD,     0.03, 0.50);
+  const metroPct = (metro / METER_MAX) * 100;
+  const stickPct = (stick / METER_MAX) * 100;
+
+  const hm = el('calib-handle-metro');
+  const hs = el('calib-handle-stick');
+  if (hm) hm.style.bottom = metroPct + '%';
+  if (hs) hs.style.bottom = stickPct + '%';
+
+  setText('calib-tag-metro',     metro.toFixed(2));
+  setText('calib-tag-stick',     stick.toFixed(2));
+  setText('calib-legend-metro',  metro.toFixed(2));
+  setText('calib-legend-metro2', metro.toFixed(2));
+  setText('calib-legend-stick',  stick.toFixed(2));
+  setText('calib-legend-noise',  stick.toFixed(2));
+
+  const zones = el('calib-zones');
+  if (zones) {
+    const s = stickPct, m = metroPct;
+    // Снизу вверх: серая (шум) → жёлтая (палочка) → красная (метроном)
+    zones.style.background =
+      `linear-gradient(to top,` +
+      ` var(--text-muted) 0%, var(--text-muted) ${s}%,` +
+      ` var(--yellow) ${s}%, var(--yellow) ${m}%,` +
+      ` var(--red) ${m}%, var(--red) 100%)`;
+  }
+}
+
+/** Применяет пороги из калибровки: обновляет config, слайдеры и ползунки. */
+function applyThresholds(metro, stick) {
+  metro = clamp(metro, 0.10, 0.95);
+  stick = clamp(stick, 0.03, 0.50);
+  if (stick >= metro) stick = clamp(metro - 0.05, 0.03, 0.50); // палочка всегда ниже
+  state.config.METRONOME_THRESHOLD = Math.round(metro * 100) / 100;
+  state.config.STICK_THRESHOLD     = Math.round(stick * 100) / 100;
+  storage.set(SK.CONFIG, state.config);
+
+  // Синхронизируем слайдеры «Параметры анализа»
+  const ms = el('cfg-metro-thresh'), ss = el('cfg-stick-thresh');
+  if (ms) { ms.value = state.config.METRONOME_THRESHOLD; setText('cfg-metro-thresh-val', state.config.METRONOME_THRESHOLD.toFixed(2)); }
+  if (ss) { ss.value = state.config.STICK_THRESHOLD;     setText('cfg-stick-thresh-val', state.config.STICK_THRESHOLD.toFixed(2)); }
+
+  syncCalibHandles();
+}
+
+/**
+ * framePeak — максимум сглаженной огибающей |x| в текущем кадре.
+ * Повторяет логику computeEnvelope (скользящее среднее |x|), чтобы
+ * значение в метре совпадало с тем, что видит analyzeAudio().
+ */
+function framePeak() {
+  const buf = calib.buf;
+  const n   = buf.length;
+  const w   = calib.smoothWin;
+  let sum = 0, peak = 0;
+  // Инициализируем окно
+  for (let i = 0; i < Math.min(w, n); i++) sum += Math.abs(buf[i]);
+  for (let i = 0; i < n; i++) {
+    const r = i + w;
+    if (r < n) sum += Math.abs(buf[r]);
+    const l = i - 1;
+    if (l >= 0) sum -= Math.abs(buf[l]);
+    const eff = Math.min(r, n) - Math.max(0, i);
+    const v = sum / eff;
+    if (v > peak) peak = v;
+  }
+  return peak;
+}
+
+/** Главный цикл отрисовки метра (requestAnimationFrame). */
+function calibLoop() {
+  if (!calib.active) return;
+  calib.analyser.getFloatTimeDomainData(calib.buf);
+  const fp = framePeak();
+  const now = performance.now();
+
+  // Уровень: мгновенная атака, плавный спад
+  calib.level    = Math.max(fp, calib.level * 0.88);
+  calib.peakHold = Math.max(fp, calib.peakHold * 0.985);
+
+  // Отрисовка
+  const lvlPct  = clamp(calib.level    / METER_MAX, 0, 1) * 100;
+  const peakPct = clamp(calib.peakHold / METER_MAX, 0, 1) * 100;
+  const fill = el('calib-fill'), peakEl = el('calib-peak');
+  if (fill)   fill.style.height = lvlPct + '%';
+  if (peakEl) peakEl.style.bottom = peakPct + '%';
+  setText('calib-live', calib.level.toFixed(3));
+
+  // Авто-калибровка: оценка шума + детекция дискретных ударов
+  if (calib.auto) {
+    if (now < calib.floorUntil) {
+      calib.floorSamples.push(fp);
+    } else if (calib.floorSamples.length && calib.noiseFloor === 0.01) {
+      // Фиксируем шумовой пол один раз: медиана стартовых кадров
+      const s = calib.floorSamples.slice().sort((a, b) => a - b);
+      calib.noiseFloor = Math.max(0.005, s[Math.floor(s.length / 2)]);
+    }
+
+    const evThresh = Math.max(0.03, calib.noiseFloor * 3);
+    if (!calib.inEvent) {
+      if (fp > evThresh && (now - calib.lastEventT) > 90) {
+        calib.inEvent = true;
+        calib.curEventPeak = fp;
+      }
+    } else {
+      if (fp > calib.curEventPeak) calib.curEventPeak = fp;
+      if (fp < evThresh * 0.6) {
+        calib.events.push(calib.curEventPeak);
+        calib.inEvent = false;
+        calib.lastEventT = now;
+      }
+    }
+
+    // Прогресс
+    const left = Math.max(0, Math.ceil((calib.autoEndT - now) / 1000));
+    setText('calib-auto-status', `Слушаю… ${left} с · ударов: ${calib.events.length}`);
+
+    if (now >= calib.autoEndT) {
+      finishAutoCalibration();
+    }
+  }
+
+  calib.raf = requestAnimationFrame(calibLoop);
+}
+
+/** Запуск живого метра (запрашивает микрофон, стартует метроном-эталон). */
+async function startCalibration() {
+  if (calib.active) return;
+  if (state.recording) { toast('Остановите запись перед калибровкой', 'error'); return; }
+  try {
+    const constraints = { audio: {
+      echoCancellation: false, noiseSuppression: false,
+      autoGainControl: false, channelCount: 1,
+    }};
+    calib.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    const AC = window.AudioContext || window.webkitAudioContext;
+    calib.ctx = new AC();
+    if (calib.ctx.state === 'suspended') await calib.ctx.resume();
+
+    calib.smoothWin = Math.max(1, Math.round(calib.ctx.sampleRate * 0.002));
+    const src = calib.ctx.createMediaStreamSource(calib.stream);
+    calib.analyser = calib.ctx.createAnalyser();
+    calib.analyser.fftSize = 2048;
+    calib.buf = new Float32Array(calib.analyser.fftSize);
+    src.connect(calib.analyser); // анализатор НЕ подключаем к destination (без петли)
+
+    calib.active   = true;
+    calib.level    = 0;
+    calib.peakHold = 0;
+
+    // Метроном как эталон, чтобы пользователь слышал такт
+    if (!metronome.isPlaying) startMetronome();
+
+    const btn = el('calib-btn');
+    if (btn) { btn.textContent = '⏹ Остановить настройку'; btn.classList.add('active'); }
+    calib.raf = requestAnimationFrame(calibLoop);
+  } catch (err) {
+    toast(`Не удалось открыть микрофон: ${err.message}`, 'error');
+  }
+}
+
+/** Остановка живого метра и освобождение ресурсов. */
+function stopCalibration() {
+  if (!calib.active) return;
+  calib.active = false;
+  calib.auto   = false;
+  if (calib.raf) cancelAnimationFrame(calib.raf);
+  calib.raf = null;
+  if (calib.stream) calib.stream.getTracks().forEach(t => t.stop());
+  if (calib.ctx)    calib.ctx.close().catch(() => {});
+  calib.stream = calib.ctx = calib.analyser = calib.buf = null;
+  if (metronome.isPlaying) stopMetronome();
+
+  const btn = el('calib-btn');
+  if (btn) { btn.textContent = '🎧 Начать настройку'; btn.classList.remove('active'); }
+  const auto = el('calib-auto-btn');
+  if (auto) auto.disabled = false;
+
+  const fill = el('calib-fill'), peakEl = el('calib-peak');
+  if (fill)   fill.style.height = '0%';
+  if (peakEl) peakEl.style.bottom = '0%';
+  setText('calib-live', '0.00');
+}
+
+function toggleCalibration() {
+  if (calib.active) stopCalibration();
+  else startCalibration();
+}
+
+/** Запуск авто-калибровки: собирает события в течение autoDur мс. */
+async function startAutoCalibration() {
+  if (!calib.active) await startCalibration();
+  if (!calib.active) return; // не удалось открыть микрофон
+
+  calib.auto         = true;
+  calib.events       = [];
+  calib.floorSamples = [];
+  calib.noiseFloor   = 0.01;
+  calib.inEvent      = false;
+  calib.curEventPeak = 0;
+  calib.lastEventT   = 0;
+  const now          = performance.now();
+  calib.floorUntil   = now + 800;   // первые 0.8 с — оценка шума
+  calib.autoEndT     = now + calib.autoDur;
+
+  const btn = el('calib-auto-btn');
+  if (btn) btn.disabled = true;
+  setText('calib-auto-status', 'Слушаю… стучите палочкой в такт метроному');
+}
+
+/** 1D k-means (k=2): делит амплитуды на «палочку» (низ) и «метроном» (верх). */
+function kmeans2(vals) {
+  const sorted = vals.slice().sort((a, b) => a - b);
+  let c1 = sorted[0], c2 = sorted[sorted.length - 1];
+  let g1 = [], g2 = [];
+  for (let it = 0; it < 25; it++) {
+    g1 = []; g2 = [];
+    for (const v of sorted) (Math.abs(v - c1) <= Math.abs(v - c2) ? g1 : g2).push(v);
+    if (!g1.length || !g2.length) break;
+    const n1 = g1.reduce((a, b) => a + b, 0) / g1.length;
+    const n2 = g2.reduce((a, b) => a + b, 0) / g2.length;
+    if (n1 === c1 && n2 === c2) break;
+    c1 = n1; c2 = n2;
+  }
+  if (!g1.length || !g2.length) return null;
+  return {
+    lowMean:  c1, highMean: c2,
+    lowMax:   Math.max(...g1), highMin: Math.min(...g2),
+    lowN:     g1.length, highN: g2.length,
+  };
+}
+
+/** Завершение авто-калибровки: анализ собранных событий и подбор порогов. */
+function finishAutoCalibration() {
+  calib.auto = false;
+  const btn = el('calib-auto-btn');
+  if (btn) btn.disabled = false;
+
+  const ev = calib.events;
+  if (ev.length < 6) {
+    setText('calib-auto-status', `Мало данных (${ev.length}). Стучите чаще и повторите.`);
+    toast('Недостаточно ударов для авто-калибровки', 'error');
+    return;
+  }
+
+  const km = kmeans2(ev);
+  if (!km) {
+    setText('calib-auto-status', 'Не удалось разделить звуки. Повторите.');
+    return;
+  }
+
+  // Если группы почти не различаются по громкости — предупреждаем
+  const sep = km.highMean / Math.max(km.lowMean, 1e-6);
+  if (sep < 1.35) {
+    setText('calib-auto-status',
+      `⚠ Метроном и палочка близки по громкости (×${sep.toFixed(2)}). Разнесите их или настройте вручную.`);
+  }
+
+  // Порог метронома — граница между кластерами; палочка — между шумом и низким кластером
+  const metro = (km.lowMax + km.highMin) / 2;
+  const stick = Math.max(calib.noiseFloor * 2.5, km.lowMean * 0.5);
+
+  applyThresholds(metro, stick);
+
+  if (sep >= 1.35) {
+    setText('calib-auto-status',
+      `✓ Готово · ${ev.length} ударов · метроном ${state.config.METRONOME_THRESHOLD.toFixed(2)}, палочка ${state.config.STICK_THRESHOLD.toFixed(2)}`);
+    toast('Пороги подобраны автоматически ✓', 'success');
+  }
+}
+
+/** Перетаскивание ползунков порогов по столбу. */
+function initCalibDrag() {
+  const meter = el('calib-meter');
+  if (!meter) return;
+
+  const valueFromEvent = (clientY) => {
+    const rect = meter.getBoundingClientRect();
+    const fromBottom = rect.bottom - clientY;         // px от низа
+    const pct = clamp(fromBottom / rect.height, 0, 1); // 0..1
+    return pct * METER_MAX;
+  };
+
+  const onMove = (clientY) => {
+    if (!calib.dragging) return;
+    let v = valueFromEvent(clientY);
+    if (calib.dragging === 'metro') {
+      applyThresholds(v, state.config.STICK_THRESHOLD);
+    } else {
+      applyThresholds(state.config.METRONOME_THRESHOLD, v);
+    }
+  };
+
+  const startDrag = (which, e) => {
+    calib.dragging = which;
+    e.preventDefault();
+  };
+
+  ['calib-handle-metro', 'calib-handle-stick'].forEach(id => {
+    const h = el(id);
+    if (!h) return;
+    const which = id.endsWith('metro') ? 'metro' : 'stick';
+    h.addEventListener('mousedown',  (e) => startDrag(which, e));
+    h.addEventListener('touchstart', (e) => startDrag(which, e), { passive: false });
+  });
+
+  window.addEventListener('mousemove', (e) => onMove(e.clientY));
+  window.addEventListener('touchmove', (e) => {
+    if (calib.dragging && e.touches[0]) { onMove(e.touches[0].clientY); e.preventDefault(); }
+  }, { passive: false });
+  window.addEventListener('mouseup',   () => { calib.dragging = null; });
+  window.addEventListener('touchend',  () => { calib.dragging = null; });
+}
+
+// ============================================================
 // 6. ЗАПИСЬ АУДИО
 // ============================================================
 
 async function startRecording() {
   if (state.recording) return;
+
+  // Калибровка занимает микрофон — останавливаем её перед записью
+  if (calib.active) stopCalibration();
 
   // Принудительно отключаем все DSP-обработки браузера —
   // они исказят амплитуды ударов и сломают поиск пиков
@@ -1283,6 +1650,8 @@ function updateProfileBadge(p) {
 // ============================================================
 
 function switchTab(tabName) {
+  // Уходим со вкладки записи — глушим калибровку (микрофон занят)
+  if (tabName !== 'record' && calib.active) stopCalibration();
   $$('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
   $$('.tab-content').forEach(s => s.classList.toggle('active', s.id === 'tab-' + tabName));
   if (tabName === 'history') renderHistory();
@@ -1320,6 +1689,7 @@ function initConfig() {
       state.config[key] = parseFloat(input.value);
       if (span) span.textContent = parseFloat(input.value).toFixed(2);
       storage.set(SK.CONFIG, state.config);
+      syncCalibHandles(); // держим ползунки калибровки в синхроне
     });
   };
 
@@ -1383,6 +1753,12 @@ document.addEventListener('DOMContentLoaded', () => {
   el('metronome-btn').addEventListener('click', toggleMetronome);
   el('bpm-minus').addEventListener('click', () => changeBpm(-BPM_STEP));
   el('bpm-plus').addEventListener('click',  () => changeBpm(+BPM_STEP));
+
+  // ── Калибровка порогов ──
+  initCalibDrag();
+  syncCalibHandles();
+  el('calib-btn').addEventListener('click', toggleCalibration);
+  el('calib-auto-btn').addEventListener('click', startAutoCalibration);
 
   // ── Сохранить как ДО / ПОСЛЕ ──
   el('save-before-btn').addEventListener('click', () => {
