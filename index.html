@@ -265,6 +265,8 @@
 
     .btn-share  { background: #312e81; color: #a5b4fc; border: 1px solid #3730a3; }
     .btn-share:hover  { background: #3730a3; }
+    .btn-html   { background: #1e3a5f; color: #7dd3fc; border: 1px solid #0369a1; }
+    .btn-html:hover   { background: #075985; }
     .btn-csv    { background: #14532d; color: #86efac; border: 1px solid #166534; }
     .btn-csv:hover    { background: #166534; }
     .btn-json   { background: #1c1917; color: #d6d3d1; border: 1px solid #44403c; }
@@ -1020,26 +1022,6 @@
         </div>
       </div>
 
-      <!-- Детализация -->
-      <div class="card">
-        <h3>📋 Детализация по ударам</h3>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Время (с)</th>
-                <th>Отклонение</th>
-                <th>Оценка</th>
-              </tr>
-            </thead>
-            <tbody id="beats-tbody">
-              <tr><td colspan="4" class="empty-msg">—</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
       <!-- Сохранение сессии -->
       <div class="card">
         <h3>💾 Сохранить результат</h3>
@@ -1057,9 +1039,17 @@
       <div class="card">
         <h3>📤 Передать специалисту</h3>
         <div class="share-btns">
-          <button class="btn btn-share" id="share-btn">📱 Поделиться</button>
-          <button class="btn btn-csv"   id="export-csv-btn">📄 Скачать CSV</button>
-          <button class="btn btn-json"  id="export-json-btn">🗂️ Скачать JSON</button>
+          <button class="btn btn-share" id="share-btn">📱 Поделиться отчётом</button>
+          <button class="btn btn-html"  id="export-html-btn">📊 Скачать отчёт (HTML)</button>
+        </div>
+        <div class="share-btns" style="margin-top:8px">
+          <button class="btn btn-csv"   id="export-csv-btn">📄 CSV</button>
+          <button class="btn btn-json"  id="export-json-btn">🗂️ JSON</button>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:10px">
+          <b>HTML-отчёт</b> — лучший формат: специалист открывает файл в любом браузере
+          и сразу видит <b>график и статистику</b>, а вы можете загрузить этот же файл
+          обратно во вкладке «История» — он встанет как полноценная сессия.
         </div>
         <!-- Меню вариантов отправки (fallback) -->
         <div id="share-menu" style="display:none">
@@ -1074,6 +1064,9 @@
             <a class="share-link" id="share-telegram-link" href="#" target="_blank">
               <span class="share-link-icon">✈️</span> Отправить в Telegram
             </a>
+            <button class="share-link" id="share-menu-html">
+              <span class="share-link-icon">📊</span> Скачать HTML-отчёт
+            </button>
             <button class="share-link" id="share-menu-csv">
               <span class="share-link-icon">📄</span> Скачать CSV-файл
             </button>
@@ -1098,6 +1091,18 @@
        ВКЛАДКА 3: ИСТОРИЯ
        ════════════════════════════════════════════════════ -->
   <section id="tab-history" class="tab-content">
+
+    <div class="card">
+      <h3>📂 Загрузить отчёт</h3>
+      <p style="font-size:13px;color:var(--text-muted);margin-bottom:10px">
+        Загрузите <b>HTML-отчёт</b> (или JSON), полученный от другого человека или с другого
+        устройства — сессия появится в истории, и её можно будет сравнить (ДО / ПОСЛЕ).
+      </p>
+      <button class="btn btn-html" id="import-report-btn" style="width:100%">
+        📂 Выбрать файл отчёта (HTML / JSON)
+      </button>
+      <input type="file" id="import-report-input" accept=".html,.htm,.json,text/html,application/json" style="display:none">
+    </div>
 
     <div class="card">
       <h3>📚 История сессий</h3>
