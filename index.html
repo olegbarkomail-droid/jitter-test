@@ -277,6 +277,89 @@
     .save-btns, .share-btns { display: flex; gap: 10px; flex-wrap: wrap; }
     .save-btns .btn, .share-btns .btn { flex: 1; min-width: 120px; }
 
+    /* ── Метроном ───────────────────────────────────────── */
+    .metronome-card { text-align: center; }
+    .metro-controls {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 18px;
+      margin-bottom: 14px;
+    }
+    .bpm-btn {
+      width: 56px; height: 56px;
+      border-radius: 50%;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--accent-h);
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all .15s;
+      flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
+    }
+    .bpm-btn:hover:not(:disabled) { background: var(--card2); border-color: var(--accent); }
+    .bpm-btn:active:not(:disabled) { transform: scale(0.92); }
+    .bpm-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    .bpm-display { min-width: 96px; }
+    .bpm-value {
+      font-size: 46px;
+      font-weight: 800;
+      line-height: 1;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+    .bpm-unit {
+      font-size: 12px;
+      color: var(--text-dim);
+      letter-spacing: .1em;
+      margin-top: 2px;
+    }
+
+    .beat-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    .beat-dot {
+      width: 18px; height: 18px;
+      border-radius: 50%;
+      background: var(--border);
+      flex-shrink: 0;
+      transition: background .05s;
+    }
+    .beat-dot.flash {
+      animation: beat-flash 0.18s ease-out;
+    }
+    @keyframes beat-flash {
+      0%   { background: var(--accent-h); box-shadow: 0 0 14px 4px rgba(129,140,248,0.7); transform: scale(1.3); }
+      100% { background: var(--border);   box-shadow: none; transform: scale(1); }
+    }
+
+    .btn-metro {
+      background: var(--card2);
+      color: var(--accent-h);
+      border: 1px solid var(--border);
+      min-width: 160px;
+    }
+    .btn-metro:hover { background: var(--surface); border-color: var(--accent); }
+    .btn-metro.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent-h);
+    }
+
+    .metro-hint {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 4px;
+      line-height: 1.5;
+    }
+
     /* ── Запись: блок статуса ─────────────────────────── */
     .record-card { text-align: center; }
     #record-status {
@@ -628,8 +711,8 @@
       <ol style="padding-left:18px;font-size:14px;color:var(--text-dim);line-height:1.8">
         <li>Заполните профиль и нажмите <b>«Сохранить»</b></li>
         <li>Перейдите на вкладку <b>«Запись»</b></li>
-        <li>Включите метроном (рекомендуется 60–80 BPM)</li>
-        <li>Нажмите <b>«Начать запись»</b> и ударяйте палочкой в такт метроному</li>
+        <li>Задайте темп встроенного метронома (по умолчанию 60 BPM, шаг ±10)</li>
+        <li>Нажмите <b>«Начать запись»</b> — метроном запустится сам; ударяйте палочкой в такт</li>
         <li>По окончании записи изучите результаты</li>
         <li>Сохраните сессию как <b>«ДО»</b> (до тренировки) или <b>«ПОСЛЕ»</b></li>
       </ol>
@@ -687,6 +770,27 @@
             Окно ±мс вокруг удара метронома
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- Метроном -->
+    <div class="card metronome-card">
+      <h3>🎵 Метроном</h3>
+      <div class="metro-controls">
+        <button class="bpm-btn" id="bpm-minus" aria-label="Уменьшить темп">−10</button>
+        <div class="bpm-display">
+          <div class="bpm-value" id="bpm-value">60</div>
+          <div class="bpm-unit">BPM</div>
+        </div>
+        <button class="bpm-btn" id="bpm-plus" aria-label="Увеличить темп">+10</button>
+      </div>
+      <div class="beat-row">
+        <span id="beat-indicator" class="beat-dot"></span>
+        <button class="btn btn-metro" id="metronome-btn">▶ Метроном</button>
+      </div>
+      <div class="metro-hint">
+        Диапазон 30–120, шаг 10. Метроном включится автоматически при записи
+        и будет служить эталонным сигналом. Кнопкой можно потренироваться заранее.
       </div>
     </div>
 
