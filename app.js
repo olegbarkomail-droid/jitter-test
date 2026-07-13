@@ -1,0 +1,1221 @@
+'use strict';
+/* ============================================================
+   app.js — Джиттер-тест PWA
+   Senior Frontend Developer + DSP Expert Implementation
+   ============================================================ */
+
+// ============================================================
+// 1. КОНФИГУРАЦИЯ ПО УМОЛЧАНИЮ
+// ============================================================
+const DEFAULT_CONFIG = {
+  METRONOME_THRESHOLD: 0.50, // Порог метронома (0–1). Удары выше — метроном.
+  STICK_THRESHOLD:     0.12, // Порог палочки (0–1). Ниже метронома.
+  MIN_PEAK_DISTANCE_MS: 300, // Мин. расстояние между ударами метронома (мс).
+                              // При 60 BPM = 1000мс, 200 BPM = 300мс. Ставим минимум.
+  SEARCH_WINDOW_MS:    200,  // Окно поиска палочки: ±200 мс от метронома.
+  EXCLUDE_ZONE_MS:      15,  // Зона вокруг метронома, куда палочка не может попасть.
+  DURATION_SEC:         60,  // Длительность записи по умолчанию (сек).
+};
+
+// ============================================================
+// 2. ГЛОБАЛЬНОЕ СОСТОЯНИЕ
+// ============================================================
+const state = {
+  profile:       null,
+  config:        { ...DEFAULT_CONFIG },
+  currentSession: null,
+  recording:     false,
+  mediaRecorder: null,
+  audioChunks:   [],
+  timerInterval: null,
+  elapsed:       0,
+  autoStopTimer: null,
+};
+
+// ============================================================
+// 3. DOM-УТИЛИТЫ
+// ============================================================
+const $  = (sel)       => document.querySelector(sel);
+const $$ = (sel)       => document.querySelectorAll(sel);
+const el = (id)        => document.getElementById(id);
+
+function show(id) { const e = el(id); if (e) e.style.display = ''; }
+function hide(id) { const e = el(id); if (e) e.style.display = 'none'; }
+function setText(id, text) { const e = el(id); if (e) e.textContent = text; }
+
+function toast(msg, type = 'info') {
+  const t = el('toast');
+  t.textContent = msg;
+  t.className = `toast toast-${type} show`;
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove('show'), 3500);
+}
+
+// ============================================================
+// 4. ХРАНИЛИЩЕ (localStorage)
+// ============================================================
+const SK = {
+  PROFILE: 'jitter_profile',
+  HISTORY: 'jitter_history',
+  BEFORE:  'jitter_before',
+  AFTER:   'jitter_after',
+  CONFIG:  'jitter_config',
+};
+
+const storage = {
+  get:  (key) => { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch { return null; } },
+  set:  (key, val) => { try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) { toast('Ошибка сохранения: ' + e.message, 'error'); } },
+  del:  (key) => { localStorage.removeItem(key); },
+};
+
+function loadProfile()  { return storage.get(SK.PROFILE); }
+function saveProfile(p) { storage.set(SK.PROFILE, p); }
+
+function loadHistory()  { return storage.get(SK.HISTORY) || []; }
+function addToHistory(session) {
+  const hist = loadHistory();
+  hist.unshift(session);
+  if (hist.length > 100) hist.pop();
+  storage.set(SK.HISTORY, hist);
+}
+function clearHistory() { storage.del(SK.HISTORY); storage.del(SK.BEFORE); storage.del(SK.AFTER); }
+
+// ============================================================
+// 5. DSP — ЦИФРОВАЯ ОБРАБОТКА СИГНАЛОВ
+// ============================================================
+
+/**
+ * computeEnvelope — вычисляет огибающую аудиосигнала.
+ *
+ * Огибающая = сглаженные абсолютные значения сигнала.
+ * Она показывает «громкость» в каждый момент времени,
+ * не зависит от знака волны (+ или −).
+ *
+ * Используем скользящее среднее с O(n) сложностью:
+ *   sliding_sum[i] = sum(|x[i-half]|...| x[i+half]|) / window_size
+ *
+ * @param {Float32Array} samples    — сырые аудиосэмплы (от −1 до +1)
+ * @param {number}       windowSize — ширина окна сглаживания в сэмплах
+ * @returns {Float32Array}          — огибающая (только положительные значения)
+ */
+function computeEnvelope(samples, windowSize) {
+  const n = samples.length;
+  const env = new Float32Array(n);
+  const half = Math.floor(windowSize / 2);
+  let sum = 0;
+
+  // Заполняем начальное окно (первые half сэмплов)
+  for (let i = 0; i < Math.min(half, n); i++) {
+    sum += Math.abs(samples[i]);
+  }
+
+  for (let i = 0; i < n; i++) {
+    // Добавляем правый край скользящего окна
+    const rEdge = i + half;
+    if (rEdge < n) sum += Math.abs(samples[rEdge]);
+
+    // Убираем левый край скользящего окна
+    const lEdge = i - half - 1;
+    if (lEdge >= 0) sum -= Math.abs(samples[lEdge]);
+
+    // Нормируем на реальный размер окна (у краёв массива окно уже)
+    const effectiveSize = Math.min(rEdge + 1, n) - Math.max(0, i - half);
+    env[i] = sum / effectiveSize;
+  }
+
+  return env;
+}
+
+/**
+ * findPeaks — находит локальные максимумы в огибающей выше заданного порога.
+ *
+ * Алгоритм (один проход слева направо):
+ *   1. Сканируем до момента, когда envelope[i] > threshold.
+ *   2. Вошли в «событие» (трансиент): идём вперёд, ищем максимум,
+ *      пока сигнал остаётся > threshold * 0.5 (хвост затухания).
+ *   3. Максимум этого события = один пик. Записываем его.
+ *   4. Прыгаем вперёд на minDistanceSamples, чтобы не поймать
+ *      эхо или рядом стоящий призрачный пик.
+ *
+ * Почему не простой «локальный максимум»?
+ *   Звуковой трансиент имеет быстрый фронт нарастания и медленный спад.
+ *   Подход через «событие» надёжнее работает с реальным аудио,
+ *   где много мелких пиков на хвосте одного удара.
+ *
+ * @param {Float32Array} env            — огибающая сигнала
+ * @param {number}       sampleRate     — частота дискретизации
+ * @param {number}       threshold      — минимальная амплитуда пика (0–1)
+ * @param {number}       minDistanceMs  — мин. расстояние между пиками (мс)
+ * @returns {Array<{index, amplitude, timeMs}>}
+ */
+function findPeaks(env, sampleRate, threshold, minDistanceMs) {
+  const minGap = Math.round((minDistanceMs / 1000) * sampleRate);
+  const peaks  = [];
+  let i = 0;
+
+  while (i < env.length) {
+    if (env[i] <= threshold) { i++; continue; }
+
+    // ── Вошли в событие: ищем локальный максимум ──────────
+    let peakAmp = env[i];
+    let peakIdx = i;
+    let j = i + 1;
+
+    // Идём вперёд пока сигнал ещё в «теле» трансиента
+    while (j < env.length && env[j] > threshold * 0.5) {
+      if (env[j] > peakAmp) {
+        peakAmp = env[j];
+        peakIdx = j;
+      }
+      j++;
+    }
+
+    peaks.push({
+      index:     peakIdx,
+      amplitude: peakAmp,
+      timeMs:    (peakIdx / sampleRate) * 1000,
+    });
+
+    // Пропускаем minGap от найденного пика (защита от двойного счёта)
+    i = peakIdx + minGap;
+  }
+
+  return peaks;
+}
+
+/**
+ * analyzeAudio — ГЛАВНАЯ ФУНКЦИЯ АНАЛИЗА.
+ *
+ * Принимает декодированный AudioBuffer и параметры конфигурации.
+ * Возвращает массив объектов — по одному на каждый обнаруженный удар.
+ *
+ * Схема работы:
+ *   [AudioBuffer]
+ *       │
+ *       ▼
+ *   computeEnvelope()          — сглаженная огибающая |x(t)|
+ *       │
+ *       ▼
+ *   findPeaks(high threshold)  — пики метронома (самые громкие)
+ *       │
+ *       ▼  для каждого пика метронома:
+ *   searchStickPeak()          — ищем пик палочки в окне ±SEARCH_WINDOW_MS
+ *       │                        исключая зону ±EXCLUDE_ZONE_MS вокруг метронома
+ *       ▼
+ *   jitter = t(палочка) − t(метроном)
+ *       отрицательный → палочка раньше метронома (ОПЕРЕЖЕНИЕ)
+ *       положительный → палочка позже  метронома (ЗАПАЗДЫВАНИЕ)
+ *
+ * @param {AudioBuffer} audioBuffer — декодированный буфер
+ * @param {object}      config      — параметры из DEFAULT_CONFIG
+ * @returns {Array<BeatResult>}
+ */
+function analyzeAudio(audioBuffer, config) {
+  const sampleRate = audioBuffer.sampleRate;
+
+  // Берём первый канал (при стерео микрофоне — левый)
+  const samples = audioBuffer.getChannelData(0);
+
+  // ── ШАГ 1: Огибающая (сглаживание ~2 мс) ─────────────────
+  const smoothWin = Math.max(1, Math.round(sampleRate * 0.002)); // ~88 сэмплов при 44100
+  const envelope  = computeEnvelope(samples, smoothWin);
+
+  // ── ШАГ 2: Пики метронома (высокий порог) ─────────────────
+  const metroPeaks = findPeaks(
+    envelope,
+    sampleRate,
+    config.METRONOME_THRESHOLD,
+    config.MIN_PEAK_DISTANCE_MS,
+  );
+
+  if (metroPeaks.length === 0) return [];
+
+  // ── ШАГ 3: Для каждого пика метронома — ищем пик палочки ──
+  const winSamples     = Math.round((config.SEARCH_WINDOW_MS / 1000) * sampleRate);
+  const excludeSamples = Math.round((config.EXCLUDE_ZONE_MS  / 1000) * sampleRate);
+
+  const results = [];
+
+  for (let m = 0; m < metroPeaks.length; m++) {
+    const metro = metroPeaks[m];
+
+    // Границы окна поиска
+    const winStart = Math.max(0, metro.index - winSamples);
+    const winEnd   = Math.min(envelope.length - 1, metro.index + winSamples);
+
+    // Ищем наибольший пик-кандидат в окне, исключая зону метронома
+    let bestAmp = -1;
+    let bestIdx = -1;
+
+    // Двухпроходный поиск: находим все превышения порога и берём максимум.
+    // Это надёжнее, чем поиск ближайшего — палочка может быть тихой,
+    // но её пик всё равно выше фонового шума.
+    let k = winStart;
+    while (k <= winEnd) {
+      // Исключаем зону вокруг метронома (там эхо удара метронома)
+      if (Math.abs(k - metro.index) <= excludeSamples) {
+        k = metro.index + excludeSamples + 1;
+        continue;
+      }
+
+      if (envelope[k] > config.STICK_THRESHOLD) {
+        // Вошли в трансиент — ищем его максимум
+        let eventAmp = envelope[k];
+        let eventIdx = k;
+        let j = k + 1;
+
+        while (j <= winEnd && Math.abs(j - metro.index) > excludeSamples &&
+               envelope[j] > config.STICK_THRESHOLD * 0.5) {
+          if (envelope[j] > eventAmp) {
+            eventAmp = envelope[j];
+            eventIdx = j;
+          }
+          j++;
+        }
+
+        // Берём самый мощный трансиент как кандидата на палочку
+        if (eventAmp > bestAmp) {
+          bestAmp = eventAmp;
+          bestIdx = eventIdx;
+        }
+        k = j;
+      } else {
+        k++;
+      }
+    }
+
+    // Если пик палочки найден — фиксируем результат
+    if (bestIdx !== -1) {
+      const metroMs = (metro.index / sampleRate) * 1000;
+      const stickMs = (bestIdx / sampleRate) * 1000;
+
+      // Джиттер со знаком:
+      //   < 0 — палочка ударила ДО метронома (опережение / anticipation)
+      //   > 0 — палочка ударила ПОСЛЕ метронома (запаздывание / delay)
+      const jitterMs = stickMs - metroMs;
+
+      results.push({
+        beatNum:             m + 1,
+        metronomeTimeMs:     Math.round(metroMs),
+        stickTimeMs:         Math.round(stickMs),
+        jitterMs:            Math.round(jitterMs),
+        metronomeAmplitude:  metro.amplitude,
+        stickAmplitude:      bestAmp,
+      });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * computeStats — вычисляет итоговую статистику по набору результатов.
+ *
+ * Ключевой момент: используем MAD (Mean Absolute Deviation),
+ * а НЕ обычное среднее, потому что +50мс и −50мс при обычном
+ * среднем дадут 0, хотя реальная точность низкая.
+ *
+ * @param {Array} results — массив BeatResult из analyzeAudio()
+ * @returns {object} статистика
+ */
+function computeStats(results) {
+  if (!results || results.length === 0) return null;
+
+  const jitters    = results.map(r => r.jitterMs);
+  const absJitters = jitters.map(Math.abs);
+  const n          = jitters.length;
+
+  // MAD — среднее абсолютное отклонение (основная метрика)
+  const mad = absJitters.reduce((a, b) => a + b, 0) / n;
+
+  // Среднее со знаком (показывает систематическое смещение:
+  // постоянно опережаете или запаздываете?)
+  const meanSigned = jitters.reduce((a, b) => a + b, 0) / n;
+
+  // Стандартное отклонение (разброс)
+  const variance = jitters.reduce((acc, j) => acc + (j - meanSigned) ** 2, 0) / n;
+  const stdDev   = Math.sqrt(variance);
+
+  // Диапазон
+  const minAbs = Math.min(...absJitters);
+  const maxAbs = Math.max(...absJitters);
+
+  // Процент попаданий в ключевые диапазоны
+  const under20  = absJitters.filter(v => v < 20).length;
+  const under50  = absJitters.filter(v => v < 50).length;
+  const under100 = absJitters.filter(v => v < 100).length;
+
+  return {
+    count:          n,
+    mad:            Math.round(mad * 10) / 10,
+    meanSigned:     Math.round(meanSigned * 10) / 10,
+    stdDev:         Math.round(stdDev * 10) / 10,
+    minAbs,
+    maxAbs,
+    percentUnder20:  Math.round((under20  / n) * 100),
+    percentUnder50:  Math.round((under50  / n) * 100),
+    percentUnder100: Math.round((under100 / n) * 100),
+    level:           getLevel(mad),
+  };
+}
+
+function getLevel(mad) {
+  if (mad < 20)  return { label: '🏆 Элитный',  color: '#22c55e', desc: 'Профессиональный уровень' };
+  if (mad < 50)  return { label: '🥇 Отличный', color: '#84cc16', desc: 'Выше среднего' };
+  if (mad < 100) return { label: '✅ Норма',     color: '#eab308', desc: 'Типичный человеческий диапазон' };
+  if (mad < 150) return { label: '📈 Базовый',  color: '#f97316', desc: 'Есть над чем работать' };
+  return                 { label: '🔰 Начальный',color: '#ef4444', desc: 'Требуется тренировка' };
+}
+
+// ============================================================
+// 6. ЗАПИСЬ АУДИО
+// ============================================================
+
+async function startRecording() {
+  if (state.recording) return;
+
+  // Принудительно отключаем все DSP-обработки браузера —
+  // они исказят амплитуды ударов и сломают поиск пиков
+  const constraints = {
+    audio: {
+      echoCancellation:  false,
+      noiseSuppression:  false,
+      autoGainControl:   false,
+      channelCount:      1,
+    }
+  };
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+    // Выбираем лучший доступный формат записи
+    const mimeTypes = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus',
+      'audio/ogg',
+      '',
+    ];
+    const mimeType = mimeTypes.find(m => !m || MediaRecorder.isTypeSupported(m)) || '';
+
+    state.audioChunks  = [];
+    state.mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+
+    state.mediaRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) state.audioChunks.push(e.data);
+    };
+
+    state.mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      processRecording();
+    };
+
+    // Собираем чанки каждые 100 мс для надёжности
+    state.mediaRecorder.start(100);
+    state.recording = true;
+    state.elapsed   = 0;
+
+    updateRecordUI(true);
+
+    // Таймер обратного отсчёта
+    const duration = parseInt(el('cfg-duration').value) || 60;
+    startTimer(duration);
+
+    // Автоостановка через duration секунд
+    state.autoStopTimer = setTimeout(() => stopRecording(), duration * 1000);
+
+  } catch (err) {
+    toast(`Ошибка доступа к микрофону: ${err.message}`, 'error');
+  }
+}
+
+function stopRecording() {
+  if (!state.recording || !state.mediaRecorder) return;
+  clearTimeout(state.autoStopTimer);
+  clearInterval(state.timerInterval);
+  state.mediaRecorder.stop();
+  state.recording = false;
+  updateRecordUI(false);
+  el('record-status').textContent = 'Анализ записи…';
+}
+
+async function processRecording() {
+  el('record-status').textContent = 'Декодирование аудио…';
+
+  try {
+    const mimeType = state.mediaRecorder.mimeType || 'audio/webm';
+    const blob = new Blob(state.audioChunks, { type: mimeType });
+
+    if (blob.size < 1000) {
+      toast('Запись слишком короткая или пустая', 'error');
+      el('record-status').textContent = 'Готов к записи';
+      return;
+    }
+
+    const arrayBuffer = await blob.arrayBuffer();
+
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const audioCtx = new AudioCtx();
+
+    el('record-status').textContent = 'Поиск пиков…';
+
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+    await audioCtx.close();
+
+    const results = analyzeAudio(audioBuffer, state.config);
+
+    if (results.length === 0) {
+      toast('Удары не обнаружены. Снизьте порог метронома или проверьте микрофон.', 'error');
+      el('record-status').textContent = 'Готов к записи';
+      return;
+    }
+
+    const stats = computeStats(results);
+
+    state.currentSession = {
+      id:        Date.now(),
+      timestamp: new Date().toISOString(),
+      profile:   state.profile ? { ...state.profile } : null,
+      config:    { ...state.config },
+      results,
+      stats,
+    };
+
+    el('record-status').textContent = `Найдено ${results.length} ударов`;
+
+    renderResults(state.currentSession);
+    show('results-section');
+    el('results-section').scrollIntoView({ behavior: 'smooth' });
+
+  } catch (err) {
+    toast(`Ошибка анализа: ${err.message}`, 'error');
+    el('record-status').textContent = 'Готов к записи';
+    console.error(err);
+  }
+}
+
+// ============================================================
+// 7. ТАЙМЕР
+// ============================================================
+
+function startTimer(totalSec) {
+  let remaining = totalSec;
+  updateTimerDisplay(remaining, totalSec);
+  state.timerInterval = setInterval(() => {
+    remaining--;
+    state.elapsed++;
+    updateTimerDisplay(remaining, totalSec);
+    const pct = ((totalSec - remaining) / totalSec) * 100;
+    el('progress-bar').style.width = pct + '%';
+    if (remaining <= 0) clearInterval(state.timerInterval);
+  }, 1000);
+}
+
+function updateTimerDisplay(remaining, total) {
+  const m = Math.floor(remaining / 60);
+  const s = remaining % 60;
+  el('timer-display').textContent = `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function updateRecordUI(isRecording) {
+  const btn = el('record-btn');
+  if (isRecording) {
+    btn.textContent = '⏹ Остановить';
+    btn.classList.add('recording');
+    show('progress-wrap');
+    el('progress-bar').style.width = '0%';
+  } else {
+    btn.textContent = '🎙️ Начать запись';
+    btn.classList.remove('recording');
+  }
+}
+
+// ============================================================
+// 8. РЕНДЕРИНГ РЕЗУЛЬТАТОВ
+// ============================================================
+
+function renderResults(session) {
+  renderStats(session.stats);
+  renderChart(session.results);
+  renderTable(session.results);
+  renderComparison();
+}
+
+/* ── Статистика ─────────────────────────────────────────── */
+function renderStats(stats) {
+  if (!stats) return;
+  const lvl = stats.level;
+
+  el('stats-grid').innerHTML = `
+    <div class="stat-card" style="border-color:${lvl.color}">
+      <div class="stat-label">Уровень</div>
+      <div class="stat-value" style="color:${lvl.color}">${lvl.label}</div>
+      <div class="stat-sub">${lvl.desc}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">MAD (среднее отклонение)</div>
+      <div class="stat-value">${stats.mad} мс</div>
+      <div class="stat-sub">Среднее абсолютное отклонение</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Систематический сдвиг</div>
+      <div class="stat-value">${stats.meanSigned > 0 ? '+' : ''}${stats.meanSigned} мс</div>
+      <div class="stat-sub">${stats.meanSigned > 0 ? 'Запаздываете' : stats.meanSigned < 0 ? 'Опережаете' : 'Без сдвига'}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Стандартное отклонение</div>
+      <div class="stat-value">±${stats.stdDev} мс</div>
+      <div class="stat-sub">Разброс результатов</div>
+    </div>
+    <div class="stat-card highlight-green">
+      <div class="stat-label">Попадания &lt;20 мс</div>
+      <div class="stat-value">${stats.percentUnder20}%</div>
+      <div class="stat-sub">${stats.count > 0 ? Math.round(stats.count * stats.percentUnder20 / 100) : 0} из ${stats.count} ударов</div>
+    </div>
+    <div class="stat-card highlight-yellow">
+      <div class="stat-label">Попадания &lt;50 мс</div>
+      <div class="stat-value">${stats.percentUnder50}%</div>
+      <div class="stat-sub">Хороший диапазон</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Диапазон</div>
+      <div class="stat-value">${stats.minAbs}–${stats.maxAbs} мс</div>
+      <div class="stat-sub">Мин–макс абсолютного отклонения</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Всего ударов</div>
+      <div class="stat-value">${stats.count}</div>
+      <div class="stat-sub">Обнаружено пар</div>
+    </div>
+  `;
+}
+
+/* ── SVG-График джиттера ────────────────────────────────── */
+function renderChart(results) {
+  const container = el('chart-container');
+  if (!results || results.length === 0) {
+    container.innerHTML = '<p class="empty-msg">Нет данных для графика</p>';
+    return;
+  }
+
+  const W  = 800, H  = 400;
+  const mT = 30, mR = 20, mB = 55, mL = 68;
+  const pW = W - mL - mR;
+  const pH = H - mT - mB;
+
+  // Автомасштаб Y: берём максимум по модулю, округляем вверх до 50
+  const rawMax   = Math.max(100, ...results.map(r => Math.abs(r.jitterMs)));
+  const yMax     = Math.ceil(rawMax / 50) * 50;
+
+  // Преобразование данных в экранные координаты
+  const xS = (i) => results.length > 1 ? (i / (results.length - 1)) * pW : pW / 2;
+  const yS = (v) => pH / 2 - (v / yMax) * (pH / 2);
+
+  // Цвет точки по абсолютному значению джиттера
+  const dotColor = (abs) => abs < 20 ? '#22c55e' : abs < 50 ? '#eab308' : '#ef4444';
+
+  // Вспомогательная функция генерации SVG-тегов
+  const tag = (name, attrs, inner = '') => {
+    const a = Object.entries(attrs).map(([k, v]) => `${k}="${v}"`).join(' ');
+    return `<${name} ${a}>${inner}</${name}>`;
+  };
+
+  let body = '';
+
+  // ── Цветные зоны (фон) ──
+  // Зелёная зона ±20 мс («элитный» диапазон)
+  body += tag('rect', { x: 0, y: yS(20), width: pW, height: yS(-20) - yS(20),
+    fill: 'rgba(34,197,94,0.12)', rx: 2 });
+  // Жёлтые зоны 20–50 мс (выше и ниже нуля)
+  body += tag('rect', { x: 0, y: yS(50),  width: pW, height: yS(20)  - yS(50),
+    fill: 'rgba(234,179,8,0.06)' });
+  body += tag('rect', { x: 0, y: yS(-20), width: pW, height: yS(-50) - yS(-20),
+    fill: 'rgba(234,179,8,0.06)' });
+
+  // ── Горизонтальные линии сетки ──
+  const gridStep = yMax <= 100 ? 25 : 50;
+  for (let v = -yMax; v <= yMax; v += gridStep) {
+    const y = yS(v);
+    const isZero = v === 0;
+    body += tag('line', {
+      x1: 0, y1: y, x2: pW, y2: y,
+      stroke: isZero ? '#94a3b8' : '#2a2d4e',
+      'stroke-width': isZero ? 2 : 1,
+      'stroke-dasharray': isZero ? '' : '4 4',
+    });
+    // Метка оси Y
+    const label = v > 0 ? `+${v}` : `${v}`;
+    body += tag('text', {
+      x: -8, y: y + 4,
+      'text-anchor': 'end', fill: '#94a3b8', 'font-size': 11,
+    }, label);
+  }
+
+  // ── Вертикальные направляющие для каждого удара ──
+  results.forEach((r, i) => {
+    const x = xS(i);
+    body += tag('line', { x1: x, y1: 0, x2: x, y2: pH,
+      stroke: '#1e2140', 'stroke-width': 1 });
+  });
+
+  // ── Ломаная линия соединения точек ──
+  const polyPts = results.map((r, i) => `${xS(i)},${yS(r.jitterMs)}`).join(' ');
+  body += tag('polyline', {
+    points: polyPts, fill: 'none',
+    stroke: '#6366f1', 'stroke-width': 1.5, opacity: 0.6,
+  });
+
+  // ── Точки (цветные кружки) ──
+  results.forEach((r, i) => {
+    const x   = xS(i);
+    const y   = yS(r.jitterMs);
+    const abs = Math.abs(r.jitterMs);
+    const col = dotColor(abs);
+
+    // Вертикальная линия от нуля до точки (визуализирует величину)
+    body += tag('line', {
+      x1: x, y1: yS(0), x2: x, y2: y,
+      stroke: col, 'stroke-width': 1.5, opacity: 0.4,
+    });
+
+    // Точка
+    body += tag('circle', {
+      cx: x, cy: y, r: 5.5,
+      fill: col, stroke: '#0d0d1a', 'stroke-width': 1.5,
+    });
+
+    // Подпись: каждые 5 ударов, первый и последний
+    const showLabel = i === 0 || i === results.length - 1 ||
+                      (results.length <= 20) || (i + 1) % 5 === 0;
+    if (showLabel) {
+      body += tag('text', {
+        x: x, y: pH + 16,
+        'text-anchor': 'middle', fill: '#64748b', 'font-size': 10,
+      }, r.beatNum);
+    }
+  });
+
+  // ── Метки осей ──
+  body += tag('text', {
+    x: pW / 2, y: pH + 40,
+    'text-anchor': 'middle', fill: '#94a3b8', 'font-size': 12,
+  }, 'Номер удара');
+
+  body += tag('text', {
+    transform: `rotate(-90) translate(${-pH / 2}, ${-mL + 14})`,
+    'text-anchor': 'middle', fill: '#94a3b8', 'font-size': 12,
+  }, 'Отклонение, мс');
+
+  const svgStr = `
+    <svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg"
+         style="width:100%;height:auto;display:block;border-radius:8px;background:#11122a">
+      <g transform="translate(${mL},${mT})">
+        ${body}
+      </g>
+    </svg>`;
+
+  container.innerHTML = svgStr;
+}
+
+/* ── Таблица детализации ─────────────────────────────────── */
+function renderTable(results) {
+  const tbody = el('beats-tbody');
+  if (!results || results.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty-msg">Нет данных</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = results.map(r => {
+    const abs  = Math.abs(r.jitterMs);
+    const sign = r.jitterMs >= 0 ? '+' : '';
+    const cls  = abs < 20 ? 'row-green' : abs < 50 ? 'row-yellow' : 'row-red';
+    const badge = abs < 20 ? '🏆 Элита' : abs < 50 ? '✅ Хорошо' : abs < 100 ? '📊 Норма' : '⚠️ Слабо';
+    const metSec = (r.metronomeTimeMs / 1000).toFixed(2);
+
+    return `<tr class="${cls}">
+      <td>${r.beatNum}</td>
+      <td>${metSec}</td>
+      <td class="jitter-val">${sign}${r.jitterMs} мс</td>
+      <td>${badge}</td>
+    </tr>`;
+  }).join('');
+}
+
+/* ── Блок сравнения ДО / ПОСЛЕ ──────────────────────────── */
+function renderComparison() {
+  const before = storage.get(SK.BEFORE);
+  const after  = storage.get(SK.AFTER);
+
+  if (!before || !after) {
+    hide('comparison-card');
+    return;
+  }
+
+  show('comparison-card');
+
+  const bS = before.stats;
+  const aS = after.stats;
+  const delta = (aS.mad - bS.mad);
+  const deltaStr = (delta <= 0 ? '▼ ' : '▲ +') + Math.abs(Math.round(delta)).toFixed(1) + ' мс';
+  const deltaColor = delta <= 0 ? '#22c55e' : '#ef4444';
+  const deltaVerb  = delta <= 0 ? 'Улучшение' : 'Ухудшение';
+
+  const d20 = aS.percentUnder20 - bS.percentUnder20;
+  const dStd = aS.stdDev - bS.stdDev;
+
+  el('comparison-content').innerHTML = `
+    <div class="compare-header">
+      <div class="compare-col">
+        <div class="compare-label">ДО</div>
+        <div class="compare-date">${formatDate(before.timestamp)}</div>
+      </div>
+      <div class="compare-arrow" style="color:${deltaColor}">
+        <div class="compare-delta">${deltaStr}</div>
+        <div class="compare-verb">${deltaVerb} MAD</div>
+      </div>
+      <div class="compare-col">
+        <div class="compare-label">ПОСЛЕ</div>
+        <div class="compare-date">${formatDate(after.timestamp)}</div>
+      </div>
+    </div>
+
+    <div class="compare-grid">
+      ${compareStat('MAD (ср. отклонение)', bS.mad + ' мс', aS.mad + ' мс', -delta)}
+      ${compareStat('Разброс (σ)', '±' + bS.stdDev + ' мс', '±' + aS.stdDev + ' мс', -dStd)}
+      ${compareStat('Попадания <20 мс', bS.percentUnder20 + '%', aS.percentUnder20 + '%', d20)}
+      ${compareStat('Попадания <50 мс', bS.percentUnder50 + '%', aS.percentUnder50 + '%', aS.percentUnder50 - bS.percentUnder50)}
+      ${compareStat('Уровень', bS.level.label, aS.level.label, 0)}
+    </div>`;
+}
+
+function compareStat(label, bVal, aVal, improvement) {
+  const icon  = improvement > 0 ? '✅' : improvement < 0 ? '❌' : '➡️';
+  return `
+    <div class="compare-stat">
+      <div class="cs-label">${label}</div>
+      <div class="cs-before">${bVal}</div>
+      <div class="cs-icon">${icon}</div>
+      <div class="cs-after">${aVal}</div>
+    </div>`;
+}
+
+/* ── История сессий ─────────────────────────────────────── */
+function renderHistory() {
+  const hist = loadHistory();
+  const container = el('history-list');
+
+  if (hist.length === 0) {
+    container.innerHTML = '<p class="empty-msg">История пуста. Сохраните сессию после замера.</p>';
+    return;
+  }
+
+  container.innerHTML = hist.map((s, idx) => {
+    const profile = s.profile;
+    const pName   = profile ? profile.name || '—' : '—';
+    const lvl     = s.stats ? s.stats.level : { label: '—', color: '#94a3b8' };
+
+    return `
+      <div class="history-item" data-idx="${idx}">
+        <div class="hi-header" onclick="toggleHistoryItem(this)">
+          <div class="hi-left">
+            <span class="hi-num">#${hist.length - idx}</span>
+            <span class="hi-name">${pName}</span>
+            <span class="hi-date">${formatDate(s.timestamp)}</span>
+          </div>
+          <div class="hi-right">
+            <span class="hi-level" style="color:${lvl.color}">${lvl.label}</span>
+            <span class="hi-mad">${s.stats ? s.stats.mad + ' мс' : '—'}</span>
+            <span class="hi-arrow">▼</span>
+          </div>
+        </div>
+        <div class="hi-body" style="display:none">
+          ${renderHistoryDetail(s)}
+          <div class="hi-actions">
+            <button class="btn btn-sm btn-share" onclick="shareSession(${idx})">📤 Поделиться</button>
+            <button class="btn btn-sm btn-csv"   onclick="exportSessionCSV(${idx})">📄 CSV</button>
+            <button class="btn btn-sm btn-json"  onclick="exportSessionJSON(${idx})">🗂️ JSON</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteHistoryItem(${idx})">🗑️</button>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function renderHistoryDetail(s) {
+  if (!s.stats) return '<p>Нет данных</p>';
+  const st = s.stats;
+  const pf = s.profile;
+
+  const profileStr = pf
+    ? `${pf.name || '—'}, ${pf.age || '—'} лет, ${pf.gender || '—'}`
+    : 'Профиль не указан';
+
+  return `
+    <div class="hi-detail">
+      <div class="hi-detail-row"><b>Профиль:</b> ${profileStr}</div>
+      ${pf && pf.email ? `<div class="hi-detail-row"><b>Email:</b> ${pf.email}</div>` : ''}
+      <div class="hi-detail-row"><b>MAD:</b> ${st.mad} мс | <b>σ:</b> ±${st.stdDev} мс</div>
+      <div class="hi-detail-row"><b>&lt;20 мс:</b> ${st.percentUnder20}% | <b>&lt;50 мс:</b> ${st.percentUnder50}%</div>
+      <div class="hi-detail-row"><b>Ударов:</b> ${st.count} | <b>Диапазон:</b> ${st.minAbs}–${st.maxAbs} мс</div>
+    </div>`;
+}
+
+window.toggleHistoryItem = function(headerEl) {
+  const body  = headerEl.nextElementSibling;
+  const arrow = headerEl.querySelector('.hi-arrow');
+  const open  = body.style.display !== 'none';
+  body.style.display  = open ? 'none' : '';
+  arrow.textContent   = open ? '▼' : '▲';
+};
+
+window.deleteHistoryItem = function(idx) {
+  if (!confirm('Удалить эту запись?')) return;
+  const hist = loadHistory();
+  hist.splice(idx, 1);
+  storage.set(SK.HISTORY, hist);
+  renderHistory();
+};
+
+// ============================================================
+// 9. ЭКСПОРТ И ПЕРЕДАЧА ДАННЫХ
+// ============================================================
+
+function sessionToText(session) {
+  const pf = session.profile;
+  const st = session.stats;
+  const dt = formatDate(session.timestamp);
+
+  let text = `=== ДЖИТТЕР-ТЕСТ ===\n`;
+  text += `Дата: ${dt}\n`;
+  if (pf) {
+    text += `Имя: ${pf.name || '—'}\n`;
+    text += `Email: ${pf.email || '—'}\n`;
+    text += `Возраст: ${pf.age || '—'} | Пол: ${pf.gender || '—'}\n`;
+  }
+  text += `\n--- СТАТИСТИКА ---\n`;
+  if (st) {
+    text += `MAD (среднее отклонение): ${st.mad} мс\n`;
+    text += `Разброс (σ): ±${st.stdDev} мс\n`;
+    text += `Систематический сдвиг: ${st.meanSigned > 0 ? '+' : ''}${st.meanSigned} мс\n`;
+    text += `Попадания <20 мс: ${st.percentUnder20}%\n`;
+    text += `Попадания <50 мс: ${st.percentUnder50}%\n`;
+    text += `Уровень: ${st.level.label}\n`;
+    text += `Всего ударов: ${st.count}\n`;
+  }
+  text += `\n--- ДЕТАЛИЗАЦИЯ ПО УДАРАМ ---\n`;
+  text += `#  | Время(с) | Отклонение\n`;
+  session.results.forEach(r => {
+    const sign = r.jitterMs >= 0 ? '+' : '';
+    text += `${r.beatNum.toString().padStart(3)} | ${(r.metronomeTimeMs/1000).toFixed(2).padStart(8)} | ${sign}${r.jitterMs} мс\n`;
+  });
+
+  return text;
+}
+
+function sessionToCSV(session) {
+  const pf = session.profile || {};
+  const st = session.stats   || {};
+
+  const header = [
+    '# удара', 'Время метронома (мс)', 'Время палочки (мс)',
+    'Джиттер (мс)', 'Джиттер |abs| (мс)', 'Оценка',
+  ].join(';');
+
+  const rows = session.results.map(r => {
+    const abs   = Math.abs(r.jitterMs);
+    const grade = abs < 20 ? 'Элита' : abs < 50 ? 'Хорошо' : abs < 100 ? 'Норма' : 'Слабо';
+    return [r.beatNum, r.metronomeTimeMs, r.stickTimeMs, r.jitterMs, abs, grade].join(';');
+  });
+
+  const meta = [
+    `# Джиттер-тест — ${formatDate(session.timestamp)}`,
+    `# Профиль: ${pf.name || '—'} | ${pf.age || '—'} лет | ${pf.gender || '—'} | ${pf.email || '—'}`,
+    `# MAD: ${st.mad} мс | σ: ${st.stdDev} мс | <20мс: ${st.percentUnder20}% | Уровень: ${st.level ? st.level.label : '—'}`,
+    '',
+    header,
+  ];
+
+  return '\uFEFF' + meta.join('\n') + '\n' + rows.join('\n'); // BOM для Excel
+}
+
+function downloadFile(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 3000);
+}
+
+function getExportFilename(session, ext) {
+  const dt   = new Date(session.timestamp);
+  const name = session.profile?.name?.replace(/\s+/g, '_') || 'noname';
+  const date = dt.toISOString().slice(0, 10);
+  return `jitter_${name}_${date}.${ext}`;
+}
+
+/* Текущая сессия */
+function exportCurrentCSV() {
+  if (!state.currentSession) { toast('Сначала сделайте запись', 'error'); return; }
+  downloadFile(sessionToCSV(state.currentSession),
+               getExportFilename(state.currentSession, 'csv'), 'text/csv;charset=utf-8');
+}
+function exportCurrentJSON() {
+  if (!state.currentSession) { toast('Сначала сделайте запись', 'error'); return; }
+  downloadFile(JSON.stringify(state.currentSession, null, 2),
+               getExportFilename(state.currentSession, 'json'), 'application/json');
+}
+
+/* Из истории */
+window.exportSessionCSV = function(idx) {
+  const s = loadHistory()[idx];
+  if (!s) return;
+  downloadFile(sessionToCSV(s), getExportFilename(s, 'csv'), 'text/csv;charset=utf-8');
+};
+window.exportSessionJSON = function(idx) {
+  const s = loadHistory()[idx];
+  if (!s) return;
+  downloadFile(JSON.stringify(s, null, 2), getExportFilename(s, 'json'), 'application/json');
+};
+
+/* Поделиться (текущая сессия или из истории) */
+async function shareSessionData(session) {
+  if (!session) { toast('Нет данных для отправки', 'error'); return; }
+
+  const text = sessionToText(session);
+  const csvBlob = new Blob([sessionToCSV(session)], { type: 'text/csv' });
+  const csvFile = new File([csvBlob], getExportFilename(session, 'csv'), { type: 'text/csv' });
+
+  // Web Share API (нативный диалог на мобильных)
+  if (navigator.share) {
+    const shareData = {
+      title:   'Джиттер-тест: результаты',
+      text:    text.slice(0, 2000), // лимит Web Share
+    };
+
+    // Пробуем прикрепить файл (не все браузеры поддерживают)
+    if (navigator.canShare && navigator.canShare({ files: [csvFile] })) {
+      shareData.files = [csvFile];
+    }
+
+    try {
+      await navigator.share(shareData);
+      return;
+    } catch (e) {
+      if (e.name === 'AbortError') return; // пользователь отменил
+      // Fallback если share с файлом не прошёл
+    }
+  }
+
+  // Fallback: меню с вариантами
+  showShareMenu(session, text);
+}
+
+function showShareMenu(session, text) {
+  const menu = el('share-menu');
+  const subject = encodeURIComponent('Джиттер-тест: результаты');
+  const body    = encodeURIComponent(text.slice(0, 1500));
+  const shortText = encodeURIComponent(
+    `Джиттер-тест: MAD ${session.stats?.mad} мс, уровень ${session.stats?.level?.label || '—'}. Детали в прикреплённом файле.`
+  );
+
+  el('share-email-link').href   = `mailto:?subject=${subject}&body=${body}`;
+  el('share-whatsapp-link').href = `https://wa.me/?text=${shortText}`;
+  el('share-telegram-link').href = `https://t.me/share/url?url=&text=${shortText}`;
+
+  menu.style.display = menu.style.display === 'none' ? '' : 'none';
+}
+
+window.shareSession = async function(idx) {
+  const s = loadHistory()[idx];
+  if (s) await shareSessionData(s);
+};
+
+// ============================================================
+// 10. ПРОФИЛЬ
+// ============================================================
+
+function loadProfileUI() {
+  const p = loadProfile();
+  if (!p) return;
+  state.profile = p;
+  const safe = (id, val) => { const e = el(id); if (e && val != null) e.value = val; };
+  safe('profile-name',  p.name);
+  safe('profile-email', p.email);
+  safe('profile-age',   p.age);
+  if (p.gender) {
+    const r = $(`input[name="gender"][value="${p.gender}"]`);
+    if (r) r.checked = true;
+  }
+  updateProfileBadge(p);
+}
+
+function collectProfile() {
+  const genderEl = $('input[name="gender"]:checked');
+  return {
+    name:   el('profile-name').value.trim(),
+    email:  el('profile-email').value.trim(),
+    age:    el('profile-age').value,
+    gender: genderEl ? genderEl.value : '',
+  };
+}
+
+function updateProfileBadge(p) {
+  const badge = el('profile-badge');
+  if (p && p.name) {
+    badge.textContent = p.name[0].toUpperCase();
+    badge.title       = `${p.name}${p.age ? ', ' + p.age + ' лет' : ''}`;
+    badge.style.display = '';
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+// ============================================================
+// 11. ВКЛАДКИ (TABS)
+// ============================================================
+
+function switchTab(tabName) {
+  $$('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
+  $$('.tab-content').forEach(s => s.classList.toggle('active', s.id === 'tab-' + tabName));
+  if (tabName === 'history') renderHistory();
+}
+
+// ============================================================
+// 12. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ============================================================
+
+function formatDate(isoStr) {
+  try {
+    return new Date(isoStr).toLocaleString('ru-RU', {
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit',
+    });
+  } catch { return isoStr || '—'; }
+}
+
+// ============================================================
+// 13. ИНИЦИАЛИЗАЦИЯ НАСТРОЕК
+// ============================================================
+
+function initConfig() {
+  const saved = storage.get(SK.CONFIG);
+  if (saved) Object.assign(state.config, saved);
+
+  // Слайдеры
+  const bindSlider = (id, key) => {
+    const input = el(id);
+    const span  = el(id + '-val');
+    if (!input) return;
+    input.value = state.config[key];
+    if (span) span.textContent = parseFloat(state.config[key]).toFixed(2);
+    input.addEventListener('input', () => {
+      state.config[key] = parseFloat(input.value);
+      if (span) span.textContent = parseFloat(input.value).toFixed(2);
+      storage.set(SK.CONFIG, state.config);
+    });
+  };
+
+  bindSlider('cfg-metro-thresh', 'METRONOME_THRESHOLD');
+  bindSlider('cfg-stick-thresh', 'STICK_THRESHOLD');
+
+  const bindNumber = (id, key) => {
+    const input = el(id);
+    if (!input) return;
+    input.value = state.config[key];
+    input.addEventListener('change', () => {
+      state.config[key] = parseFloat(input.value);
+      storage.set(SK.CONFIG, state.config);
+    });
+  };
+
+  bindNumber('cfg-duration', 'DURATION_SEC');
+  bindNumber('cfg-window',   'SEARCH_WINDOW_MS');
+}
+
+// ============================================================
+// 14. ТОЧКА ВХОДА — ИНИЦИАЛИЗАЦИЯ
+// ============================================================
+
+document.addEventListener('DOMContentLoaded', () => {
+
+  // Service Worker
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').catch(console.warn);
+  }
+
+  // Профиль
+  loadProfileUI();
+  initConfig();
+
+  // ── Вкладки ──
+  $$('.tab').forEach(btn => {
+    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  });
+
+  // ── Профиль: сохранение ──
+  el('save-profile-btn').addEventListener('click', () => {
+    const p = collectProfile();
+    state.profile = p;
+    saveProfile(p);
+    updateProfileBadge(p);
+    toast('Профиль сохранён ✓', 'success');
+  });
+
+  // ── Запись ──
+  el('record-btn').addEventListener('click', () => {
+    if (state.recording) stopRecording();
+    else startRecording();
+  });
+
+  // ── Сохранить как ДО / ПОСЛЕ ──
+  el('save-before-btn').addEventListener('click', () => {
+    if (!state.currentSession) { toast('Сначала сделайте запись', 'error'); return; }
+    storage.set(SK.BEFORE, state.currentSession);
+    addToHistory({ ...state.currentSession, type: 'ДО' });
+    toast('Сохранено как сессия «ДО» ✓', 'success');
+    renderComparison();
+  });
+
+  el('save-after-btn').addEventListener('click', () => {
+    if (!state.currentSession) { toast('Сначала сделайте запись', 'error'); return; }
+    storage.set(SK.AFTER, state.currentSession);
+    addToHistory({ ...state.currentSession, type: 'ПОСЛЕ' });
+    toast('Сохранено как сессия «ПОСЛЕ» ✓', 'success');
+    renderComparison();
+  });
+
+  // ── Экспорт ──
+  el('export-csv-btn').addEventListener('click', exportCurrentCSV);
+  el('export-json-btn').addEventListener('click', exportCurrentJSON);
+
+  // ── Поделиться ──
+  el('share-btn').addEventListener('click', () => shareSessionData(state.currentSession));
+
+  el('share-menu-csv').addEventListener('click', exportCurrentCSV);
+  el('share-menu-json').addEventListener('click', exportCurrentJSON);
+
+  // ── Очистить историю ──
+  el('clear-history-btn').addEventListener('click', () => {
+    if (!confirm('Очистить всю историю и сессии ДО/ПОСЛЕ?')) return;
+    clearHistory();
+    renderHistory();
+    toast('История очищена', 'info');
+  });
+
+  // Закрытие share-меню по клику вне его
+  document.addEventListener('click', (e) => {
+    const menu = el('share-menu');
+    if (menu && !menu.contains(e.target) && e.target !== el('share-btn')) {
+      menu.style.display = 'none';
+    }
+  });
+
+  // Инициализируем отображение истории на вкладке
+  hide('results-section');
+  hide('share-menu');
+
+  // Показываем кнопку сравнения если обе сессии есть
+  renderComparison();
+});
