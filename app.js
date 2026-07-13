@@ -15,7 +15,13 @@ const DEFAULT_CONFIG = {
   SEARCH_WINDOW_MS:    200,  // Окно поиска палочки: ±200 мс от метронома.
   EXCLUDE_ZONE_MS:      15,  // Зона вокруг метронома, куда палочка не может попасть.
   DURATION_SEC:         60,  // Длительность записи по умолчанию (сек).
+  BPM:                  60,  // Темп метронома. Фиксированный шаг 10, диапазон 30–120.
 };
+
+// Ограничения метронома (фиксированная сетка значений)
+const BPM_MIN  = 30;
+const BPM_MAX  = 120;
+const BPM_STEP = 10;
 
 // ============================================================
 // 2. ГЛОБАЛЬНОЕ СОСТОЯНИЕ
@@ -368,6 +374,182 @@ function getLevel(mad) {
 }
 
 // ============================================================
+// 5b. МЕТРОНОМ — синтез механического «тик» через Web Audio API
+// ============================================================
+//
+// Метроном служит ЭТАЛОННЫМ сигналом: во время записи он звучит через
+// динамик, микрофон ловит его щелчки (самые громкие пики), а пользователь
+// бьёт палочкой в такт. Так появляется фиксированная опорная сетка,
+// относительно которой считается джиттер.
+//
+// Звук синтезируется на лету (без аудиофайлов) — это сохраняет полностью
+// оффлайновую работу PWA. «Механический» тембр собирается из двух
+// компонентов с очень быстрым затуханием (имитация щелчка рычага +
+// резонанс деревянного корпуса классического метронома).
+//
+// Тайминг реализован по паттерну «lookahead scheduler» (A. Wittel):
+// setInterval будит планировщик каждые 25 мс, а сами щелчки ставятся
+// в очередь точного аппаратного таймера AudioContext на 100 мс вперёд.
+// Это даёт стабильный ритм без «плавания», в отличие от простого setInterval.
+
+const metronome = {
+  ctx:           null,   // AudioContext (создаётся при первом запуске)
+  isPlaying:     false,
+  bpm:           60,
+  nextNoteTime:  0,      // время следующего щелчка в часах AudioContext (сек)
+  lookahead:     25,     // мс — период пробуждения планировщика
+  scheduleAhead: 0.10,   // с — горизонт планирования щелчков вперёд
+  timerId:       null,
+  volume:        0.9,    // громкость метронома (0–1)
+};
+
+/** Создаёт (или возобновляет) AudioContext. Должно вызываться из жеста пользователя. */
+function ensureAudioCtx() {
+  if (!metronome.ctx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    metronome.ctx = new AC();
+  }
+  // На мобильных контекст стартует «suspended» — будим его
+  if (metronome.ctx.state === 'suspended') metronome.ctx.resume();
+  return metronome.ctx;
+}
+
+/**
+ * scheduleClick — ставит в очередь ОДИН механический щелчок на момент `time`.
+ *
+ * Тембр = сумма двух осцилляторов с независимыми огибающими:
+ *   1) Высокий «клик» рычага   — square 3200 Гц, спад ~30 мс
+ *   2) Низкий «корпус» короба  — triangle 900 Гц, спад ~55 мс
+ * Плюс общий полосовой фильтр слегка «деревянит» звук.
+ *
+ * Огибающие строятся на аппаратных рампах AudioParam — они сэмпл-точны
+ * и не зависят от загрузки основного JS-потока.
+ *
+ * @param {number} time — абсолютное время старта в часах AudioContext (сек)
+ */
+function scheduleClick(time) {
+  const ctx = metronome.ctx;
+
+  // Общий выход щелчка с лёгким полосовым окрасом
+  const master = ctx.createGain();
+  master.gain.value = metronome.volume;
+
+  const shaper = ctx.createBiquadFilter();
+  shaper.type = 'bandpass';
+  shaper.frequency.value = 1800;
+  shaper.Q.value = 0.7;
+
+  master.connect(shaper);
+  shaper.connect(ctx.destination);
+
+  // ── Компонент 1: высокочастотный щелчок рычага ──
+  const o1 = ctx.createOscillator();
+  o1.type = 'square';
+  o1.frequency.value = 3200;
+  const g1 = ctx.createGain();
+  g1.gain.setValueAtTime(0.0001, time);
+  g1.gain.exponentialRampToValueAtTime(0.9,   time + 0.001); // мгновенная атака
+  g1.gain.exponentialRampToValueAtTime(0.0001, time + 0.030); // быстрый спад
+  o1.connect(g1); g1.connect(master);
+
+  // ── Компонент 2: низкий корпусной резонанс ──
+  const o2 = ctx.createOscillator();
+  o2.type = 'triangle';
+  o2.frequency.value = 900;
+  const g2 = ctx.createGain();
+  g2.gain.setValueAtTime(0.0001, time);
+  g2.gain.exponentialRampToValueAtTime(0.55,  time + 0.002);
+  g2.gain.exponentialRampToValueAtTime(0.0001, time + 0.055);
+  o2.connect(g2); g2.connect(master);
+
+  // Запуск и остановка (короткая жизнь узлов — авто-сборка мусора)
+  o1.start(time); o1.stop(time + 0.07);
+  o2.start(time); o2.stop(time + 0.07);
+}
+
+/** Планировщик: ставит в очередь все щелчки, попадающие в горизонт scheduleAhead. */
+function metronomeScheduler() {
+  const ctx = metronome.ctx;
+  const secondsPerBeat = 60.0 / metronome.bpm; // интервал между щелчками
+
+  while (metronome.nextNoteTime < ctx.currentTime + metronome.scheduleAhead) {
+    scheduleClick(metronome.nextNoteTime);
+
+    // Визуальная вспышка индикатора синхронно со щелчком
+    const delayMs = (metronome.nextNoteTime - ctx.currentTime) * 1000;
+    setTimeout(flashBeat, Math.max(0, delayMs));
+
+    metronome.nextNoteTime += secondsPerBeat;
+  }
+}
+
+function startMetronome() {
+  if (metronome.isPlaying) return;
+  const ctx = ensureAudioCtx();
+  metronome.isPlaying    = true;
+  metronome.bpm          = state.config.BPM || 60;
+  metronome.nextNoteTime = ctx.currentTime + 0.10; // небольшой запас на старт
+  metronome.timerId      = setInterval(metronomeScheduler, metronome.lookahead);
+  updateMetronomeUI(true);
+}
+
+function stopMetronome() {
+  if (!metronome.isPlaying) return;
+  metronome.isPlaying = false;
+  clearInterval(metronome.timerId);
+  metronome.timerId = null;
+  updateMetronomeUI(false);
+}
+
+function toggleMetronome() {
+  if (metronome.isPlaying) stopMetronome();
+  else startMetronome();
+}
+
+/** Меняет BPM по фиксированной сетке (шаг 10, диапазон 30–120). */
+function changeBpm(delta) {
+  let bpm = (state.config.BPM || 60) + delta;
+  bpm = Math.max(BPM_MIN, Math.min(BPM_MAX, bpm));
+  state.config.BPM = bpm;
+  metronome.bpm    = bpm; // применяется на лету, даже если метроном играет
+  storage.set(SK.CONFIG, state.config);
+  updateBpmUI();
+}
+
+function updateBpmUI() {
+  const bpm = state.config.BPM || 60;
+  const v = el('bpm-value');
+  if (v) v.textContent = bpm;
+  const minus = el('bpm-minus');
+  const plus  = el('bpm-plus');
+  if (minus) minus.disabled = bpm <= BPM_MIN;
+  if (plus)  plus.disabled  = bpm >= BPM_MAX;
+}
+
+function updateMetronomeUI(isPlaying) {
+  const btn = el('metronome-btn');
+  if (btn) {
+    btn.textContent = isPlaying ? '⏸ Стоп метроном' : '▶ Метроном';
+    btn.classList.toggle('active', isPlaying);
+  }
+  // Кнопки смены темпа блокируем во время записи, но не при простой практике
+  if (!isPlaying) {
+    const dot = el('beat-indicator');
+    if (dot) dot.classList.remove('flash');
+  }
+}
+
+/** Короткая визуальная вспышка индикатора доли. */
+function flashBeat() {
+  const dot = el('beat-indicator');
+  if (!dot) return;
+  dot.classList.remove('flash');
+  // reflow для перезапуска CSS-анимации
+  void dot.offsetWidth;
+  dot.classList.add('flash');
+}
+
+// ============================================================
 // 6. ЗАПИСЬ АУДИО
 // ============================================================
 
@@ -415,6 +597,10 @@ async function startRecording() {
     state.recording = true;
     state.elapsed   = 0;
 
+    // Запускаем метроном как эталонный сигнал — микрофон запишет его щелчки
+    startMetronome();
+    lockBpmControls(true);
+
     updateRecordUI(true);
 
     // Таймер обратного отсчёта
@@ -433,10 +619,21 @@ function stopRecording() {
   if (!state.recording || !state.mediaRecorder) return;
   clearTimeout(state.autoStopTimer);
   clearInterval(state.timerInterval);
+  stopMetronome();          // глушим эталонный метроном
+  lockBpmControls(false);
   state.mediaRecorder.stop();
   state.recording = false;
   updateRecordUI(false);
   el('record-status').textContent = 'Анализ записи…';
+}
+
+/** Блокирует смену темпа/метронома во время записи (эталон нельзя менять на ходу). */
+function lockBpmControls(locked) {
+  ['bpm-minus', 'bpm-plus', 'metronome-btn'].forEach(id => {
+    const e = el(id);
+    if (e) e.disabled = locked;
+  });
+  if (!locked) updateBpmUI(); // вернуть корректное состояние границ 30/120
 }
 
 async function processRecording() {
@@ -462,7 +659,16 @@ async function processRecording() {
     const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
     await audioCtx.close();
 
-    const results = analyzeAudio(audioBuffer, state.config);
+    // Темп известен → задаём мин. расстояние между щелчками метронома как
+    // ~55% интервала доли. Это отсекает эхо/двойные срабатывания, но не
+    // теряет реальные удары (интервал доли при 30–120 BPM = 2000–500 мс).
+    const beatMs = 60000 / (state.config.BPM || 60);
+    const analysisConfig = {
+      ...state.config,
+      MIN_PEAK_DISTANCE_MS: Math.round(beatMs * 0.55),
+    };
+
+    const results = analyzeAudio(audioBuffer, analysisConfig);
 
     if (results.length === 0) {
       toast('Удары не обнаружены. Снизьте порог метронома или проверьте микрофон.', 'error');
@@ -1132,6 +1338,10 @@ function initConfig() {
 
   bindNumber('cfg-duration', 'DURATION_SEC');
   bindNumber('cfg-window',   'SEARCH_WINDOW_MS');
+
+  // Метроном: синхронизируем BPM из сохранённого конфига
+  metronome.bpm = state.config.BPM || 60;
+  updateBpmUI();
 }
 
 // ============================================================
@@ -1168,6 +1378,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (state.recording) stopRecording();
     else startRecording();
   });
+
+  // ── Метроном ──
+  el('metronome-btn').addEventListener('click', toggleMetronome);
+  el('bpm-minus').addEventListener('click', () => changeBpm(-BPM_STEP));
+  el('bpm-plus').addEventListener('click',  () => changeBpm(+BPM_STEP));
 
   // ── Сохранить как ДО / ПОСЛЕ ──
   el('save-before-btn').addEventListener('click', () => {
