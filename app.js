@@ -392,41 +392,140 @@ function alignComb(env, sampleRate, metroSamples) {
 }
 
 /**
- * analyzeAudioByGrid — ГЛАВНЫЙ анализ (по сетке метронома).
+ * alignCombDrift — как alignComb, но дополнительно оценивает ЛИНЕЙНЫЙ ДРЕЙФ.
  *
- * @param {Float32Array} samples      — записанный PCM (моно)
- * @param {number}       sampleRate   — частота дискретизации
- * @param {Array<number>} metroSamples — индексы сэмплов запланированных щелчков
- * @param {object}       config       — { SEARCH_WINDOW_MS, ... }
- * @returns {Array<BeatResult>}
+ * ЗАЧЕМ. Метроном планируется на часах AudioContext, а запись оцифровывается
+ * своим АЦП. Между этими часами есть небольшой рассинхрон (доли процента),
+ * из-за которого просочившийся в микрофон звук метронома «уползает» от
+ * запланированной сетки — на дистанции 60 с уход достигает 100+ мс.
+ * Обычный comb с одним lag это не ловит, и жёсткая сетка становится неверной
+ * опорой (именно это давало фиктивные результаты при полной тишине).
+ *
+ * Здесь мы ищем ПАРУ (lag, drift): позиция k-й доли = scheduled_k + lag + drift*k.
+ * Максимум суммарной огибающей в этих узлах = реальное положение утечки
+ * метронома в записи, уже в ЕДИНОЙ с ударами палочки шкале времени.
+ *
+ * @returns {{lag:number, drift:number, conf:number}} в сэмплах, conf — уверенность
+ */
+function alignCombDrift(env, sampleRate, metroSamples) {
+  if (!metroSamples || metroSamples.length === 0) return { lag: 0, drift: 0, conf: 0 };
+  const n = env.length;
+  const K = metroSamples.length;
+  const minLag  = Math.round(-0.05 * sampleRate);
+  const maxLag  = Math.round(0.45 * sampleRate);
+  const lagStep = Math.max(1, Math.round(0.0005 * sampleRate)); // ~0.5 мс
+  // Дрейф: до ±3.5 мс на долю (перекрывает ~0.35% рассинхрона на 60 долях).
+  const maxDrift  = 0.0035 * sampleRate;
+  const driftStep = Math.max(1, Math.round(0.0002 * sampleRate)); // ~0.2 мс/долю
+
+  // Оценка кандидата — МЕДИАНА огибающей в узлах сетки (а не сумма/среднее).
+  // Почему медиана: метроном звучит на КАЖДОЙ доле → медиана высокая. Удары
+  // палочки дрожат по времени (±десятки мс) и в точный узел попадают редко →
+  // их медиана низкая, даже если отдельные удары громче метронома. Так мы
+  // надёжно цепляемся именно за метроном, а не за более громкие удары.
+  let best = { lag: 0, drift: 0, conf: 0, score: -1 };
+  const scores = [];
+  const nodeVals = new Array(K);
+  for (let drift = -maxDrift; drift <= maxDrift; drift += driftStep) {
+    for (let lag = minLag; lag <= maxLag; lag += lagStep) {
+      let c = 0;
+      for (let i = 0; i < K; i++) {
+        const idx = Math.round(metroSamples[i] + lag + drift * i);
+        nodeVals[i] = (idx >= 0 && idx < n) ? env[idx] : 0;
+        if (idx >= 0 && idx < n) c++;
+      }
+      if (c === 0) continue;
+      const med = median(nodeVals);
+      scores.push(med);
+      if (med > best.score) best = { lag, drift, conf: 0, score: med };
+    }
+  }
+  const medScore = median(scores);
+  best.conf = medScore > 0 ? best.score / medScore : 0;
+  return best;
+}
+
+/**
+ * analyzeAudioByGrid — ГЛАВНЫЙ анализ (по сетке метронома) с детекцией промахов.
+ *
+ * ПРИНЦИПЫ (после разбора реального провального замера):
+ *  1. Опору (моменты долей) берём из ЗАПИСИ, а не из планировщика: находим
+ *     просочившийся звук метронома с учётом дрейфа часов (alignCombDrift).
+ *     Тогда девиация палочки считается в одной шкале — без ложного «сползания».
+ *  2. ЯВНО различаем «удар был» и «удара не было». Если рядом с долей только
+ *     сам метроном (или тишина) — это ПРОМАХ, а не выдуманный удар. Раньше
+ *     алгоритм всегда брал самый громкий трансиент и на тишине выдавал за
+ *     удар утечку метронома — отсюда «результаты» при полном молчании.
+ *
+ * @returns {{results:Array<BeatResult>, expectedBeats:number,
+ *            acoustic:boolean, misses:number, metroLevel:number}}
  */
 function analyzeAudioByGrid(samples, sampleRate, metroSamples, config) {
   const n = samples.length;
   const smoothWin = Math.max(1, Math.round(sampleRate * 0.002)); // ~2 мс
   const env = computeEnvelope(samples, smoothWin);
 
-  // Автопорог палочки из уровня шума (никакой ручной калибровки)
   const noiseFloor = estimateNoiseFloor(env);
   const gate = Math.max(noiseFloor * 3.5 + 0.002, 0.008);
 
-  // 1) Находим реальную позицию щелчков метронома в записи (акустическая задержка).
-  //    Если утечки метронома в микрофоне нет (например, наушники) — уверенность
-  //    низкая, и мы используем запланированное время как есть (lag = 0).
-  const { lag, conf } = alignComb(env, sampleRate, metroSamples);
-  const acoustic = conf >= 3.0;      // есть ли уверенно слышимая утечка метронома
-  const effLag   = acoustic ? lag : 0;
+  const expectedBeats = metroSamples.length;
+  const metroTol = Math.round(0.024 * sampleRate); // ±24 мс — «зона» щелчка метронома
+  const refTol   = Math.round(0.004 * sampleRate); // ±4 мс — уточнение позиции доли
+                                                   // (узко: чтобы не «прилипнуть» к громкому удару рядом)
 
-  const gridPos = [];
-  for (const s of metroSamples) {
-    const i = s + effLag;
-    if (i >= 0 && i < n) gridPos.push(i);
+  // Строим позиции долей для заданного (lag, drift). При acoustic уточняем
+  // каждую долю к локальному максимуму огибающей (прилипаем к щелчку метронома).
+  function buildGrid(effLag, effDrift, snap) {
+    const gp = [];
+    for (let i = 0; i < metroSamples.length; i++) {
+      let g = Math.round(metroSamples[i] + effLag + effDrift * i);
+      if (g < 0 || g >= n) continue;
+      if (snap) {
+        const lo = Math.max(0, g - refTol), hi = Math.min(n - 1, g + refTol);
+        let bi = g, ba = env[g];
+        for (let k = lo; k <= hi; k++) if (env[k] > ba) { ba = env[k]; bi = k; }
+        g = bi;
+      }
+      gp.push(g);
+    }
+    return gp;
   }
-  if (gridPos.length === 0) return [];
+
+  // 1) Ловим реальное положение метронома в записи с учётом дрейфа часов.
+  const { lag, drift, conf } = alignCombDrift(env, sampleRate, metroSamples);
+  let acoustic = conf >= 3.0;              // уверенно слышен периодический сигнал?
+  let gridPos, metroLevel;
+
+  if (acoustic) {
+    // CV и уровень метронома считаем по СЫРЫМ узлам сетки (без «прилипания»),
+    // чтобы близкий громкий удар не исказил оценку самого метронома.
+    const rawNodes = buildGrid(lag, drift, false).map(g => env[g]);
+    if (rawNodes.length === 0) {
+      return { results: [], expectedBeats, acoustic, misses: expectedBeats, metroLevel: 0 };
+    }
+    const mLevel  = median(rawNodes);
+    const meanAmp = rawNodes.reduce((a, b) => a + b, 0) / rawNodes.length;
+    const varAmp  = rawNodes.reduce((a, b) => a + (b - meanAmp) ** 2, 0) / rawNodes.length;
+    const cv = meanAmp > 0 ? Math.sqrt(varAmp) / meanAmp : 999;
+    // Метроном — МАШИННЫЙ звук: почти постоянная амплитуда на всех долях.
+    // Большой разброс → это не метроном, а сами удары палочки (метроном в
+    // наушниках). Тогда опору берём из расписания, а не из дрожащего сигнала.
+    if (cv > 0.30) { acoustic = false; }
+    else { gridPos = buildGrid(lag, drift, true); metroLevel = mLevel; }
+  }
+
+  if (!acoustic) {
+    // Утечки метронома нет — используем запланированную сетку как есть.
+    gridPos = buildGrid(0, 0, false);
+    metroLevel = 0;
+    if (gridPos.length === 0) {
+      return { results: [], expectedBeats, acoustic, misses: expectedBeats, metroLevel: 0 };
+    }
+  }
 
   const winSamples = Math.round((config.SEARCH_WINDOW_MS / 1000) * sampleRate);
-  const metroTol   = Math.round(0.022 * sampleRate); // ±22 мс — «зона» щелчка метронома
 
-  // Хелпер: лучший трансиент в диапазоне [lo,hi], ИСКЛЮЧАЯ зону метронома
+  // Лучший трансиент в [lo,hi], ВНЕ зоны метронома (удар мимо такта).
   function bestTransientOutside(g, lo, hi) {
     let bestAmp = -1, bestIdx = -1, k = lo;
     while (k <= hi) {
@@ -444,55 +543,59 @@ function analyzeAudioByGrid(samples, sampleRate, metroSamples, config) {
     return { amp: bestAmp, idx: bestIdx };
   }
 
-  // 2) По каждой доле выбираем удар палочки.
-  //    Логика (амплитудная, без ручных порогов):
-  //      • Aoff — самый громкий трансиент ВНЕ зоны метронома (палочка мимо такта);
-  //      • Aon  — пик В зоне метронома (там палочка «легла» на щелчок или только щелчок).
-  //    Удар палочки — это самый громкий из них. Если громче внезонный пик —
-  //    палочка сыграна мимо; если пик на бите заметно выше уровня шума —
-  //    палочка попала точно в такт (её и берём, дав девиацию ≈ 0).
+  // Порог «на бите есть удар»: пик заметно выше типичного щелчка метронома.
+  const onBeatStickGate = acoustic
+    ? Math.max(metroLevel * 1.5, gate * 2.5)
+    : gate * 1.5;
+  // Порог «удар мимо такта реален»: выше шума и сопоставим со щелчком метронома
+  // (чтобы слабое эхо/хвост метронома не считались отдельным ударом).
+  const offBeatStickGate = acoustic
+    ? Math.max(metroLevel * 0.6, gate * 2.0)
+    : gate;
+
   const results = [];
+  let misses = 0;
   for (let b = 0; b < gridPos.length; b++) {
     const g  = gridPos[b];
     const lo = Math.max(0, g - winSamples);
     const hi = Math.min(n - 1, g + winSamples);
 
-    // Пик ПРЯМО на бите (в зоне метронома)
+    // Пик прямо на бите (в зоне метронома)
     let onAmp = -1, onIdx = -1;
     const olo = Math.max(0, g - metroTol), ohi = Math.min(n - 1, g + metroTol);
     for (let k = olo; k <= ohi; k++) if (env[k] > onAmp) { onAmp = env[k]; onIdx = k; }
 
-    // Лучший трансиент ВНЕ зоны метронома
+    // Лучший трансиент вне зоны метронома
     const off = bestTransientOutside(g, lo, hi);
 
     let stickIdx = -1, stickAmp = -1;
-    if (off.idx !== -1 && off.amp >= onAmp) {
-      // Чёткий удар мимо такта (громче, чем всё на бите)
+    if (off.idx !== -1 && off.amp >= offBeatStickGate && off.amp >= onAmp * 0.9) {
+      // Чёткий удар мимо такта
       stickIdx = off.idx; stickAmp = off.amp;
-    } else if (onAmp > gate * 1.5) {
-      // Есть заметная энергия на бите → палочка попала в такт
+    } else if (onAmp > onBeatStickGate) {
+      // На бите энергии заметно больше, чем у одного метронома → удар попал в такт
       stickIdx = onIdx; stickAmp = onAmp;
-    } else if (off.idx !== -1) {
-      // Слабый, но реальный удар мимо такта
+    } else if (!acoustic && off.idx !== -1 && off.amp >= offBeatStickGate) {
+      // Наушники/без утечки: любой реальный трансиент в окне — это удар
       stickIdx = off.idx; stickAmp = off.amp;
     }
 
-    if (stickIdx !== -1) {
-      const metroMs  = (g / sampleRate) * 1000;
-      const stickMs  = (stickIdx / sampleRate) * 1000;
-      const jitterMs = stickMs - metroMs; // <0 опережение, >0 запаздывание
-      results.push({
-        beatNum:            b + 1,
-        metronomeTimeMs:    Math.round(metroMs),
-        stickTimeMs:        Math.round(stickMs),
-        jitterMs:           Math.round(jitterMs),
-        metronomeAmplitude: +env[g].toFixed(3),
-        stickAmplitude:     +Math.max(0, stickAmp).toFixed(3),
-      });
-    }
+    if (stickIdx === -1) { misses++; continue; } // удара рядом с долей не было
+
+    const metroMs  = (g / sampleRate) * 1000;
+    const stickMs  = (stickIdx / sampleRate) * 1000;
+    const jitterMs = stickMs - metroMs; // <0 опережение, >0 запаздывание
+    results.push({
+      beatNum:            b + 1,
+      metronomeTimeMs:    Math.round(metroMs),
+      stickTimeMs:        Math.round(stickMs),
+      jitterMs:           Math.round(jitterMs),
+      metronomeAmplitude: +env[g].toFixed(3),
+      stickAmplitude:     +Math.max(0, stickAmp).toFixed(3),
+    });
   }
 
-  return results;
+  return { results, expectedBeats, acoustic, misses, metroLevel };
 }
 
 /**
@@ -1239,10 +1342,14 @@ function processRecording(pcm, sampleRate, clickTimes, recStartSec) {
       }
     }
 
-    let results;
+    let results, expectedBeats = 0, misses = 0, acoustic = false;
     if (metroSamples.length >= 3) {
       // ОСНОВНОЙ путь: анализ по известной сетке метронома (без калибровки)
-      results = analyzeAudioByGrid(pcm, sampleRate, metroSamples, state.config);
+      const g = analyzeAudioByGrid(pcm, sampleRate, metroSamples, state.config);
+      results       = g.results;
+      expectedBeats = g.expectedBeats;
+      misses        = g.misses;
+      acoustic      = g.acoustic;
     } else {
       // Резерв: сетки нет (метроном не играл) — старый амплитудный метод
       const beatMs = 60000 / (state.config.BPM || 60);
@@ -1250,15 +1357,31 @@ function processRecording(pcm, sampleRate, clickTimes, recStartSec) {
         { sampleRate, getChannelData: () => pcm },
         { ...state.config, MIN_PEAK_DISTANCE_MS: Math.round(beatMs * 0.55) },
       );
+      expectedBeats = results.length;
     }
 
     if (results.length === 0) {
-      toast('Удары палочкой не обнаружены. Проверьте, что микрофон слышит удары.', 'error');
+      toast(
+        expectedBeats > 0
+          ? `Удары палочкой не обнаружены (0 из ${expectedBeats} долей). Рядом с долями слышен только метроном или тишина — постучите палочкой в такт.`
+          : 'Удары палочкой не обнаружены. Проверьте, что микрофон слышит удары.',
+        'error',
+      );
       el('record-status').textContent = 'Готов к записи';
       return;
     }
 
+    // Предупреждаем, если распознана лишь малая часть долей (много промахов).
+    if (expectedBeats > 0 && results.length < expectedBeats * 0.5) {
+      toast(
+        `Внимание: удары найдены лишь на ${results.length} из ${expectedBeats} долей. ` +
+        `Остальные засчитаны как пропуски (тишина/без удара). Статистика — только по реальным ударам.`,
+        'error',
+      );
+    }
+
     const stats = computeStats(results);
+    if (stats) { stats.expectedBeats = expectedBeats; stats.misses = misses; }
 
     state.currentSession = {
       id:        Date.now(),
@@ -1269,7 +1392,9 @@ function processRecording(pcm, sampleRate, clickTimes, recStartSec) {
       stats,
     };
 
-    el('record-status').textContent = `Найдено ${results.length} ударов`;
+    el('record-status').textContent = expectedBeats > 0
+      ? `Найдено ${results.length} ударов из ${expectedBeats} долей`
+      : `Найдено ${results.length} ударов`;
 
     renderResults(state.currentSession);
     show('results-section');
@@ -1370,9 +1495,9 @@ function renderStats(stats) {
       <div class="stat-sub">Мин–макс абсолютного отклонения</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Всего ударов</div>
-      <div class="stat-value">${stats.count}</div>
-      <div class="stat-sub">Обнаружено пар</div>
+      <div class="stat-label">Ударов детектировано</div>
+      <div class="stat-value">${stats.count}${stats.expectedBeats ? ' / ' + stats.expectedBeats : ''}</div>
+      <div class="stat-sub">${stats.expectedBeats ? (stats.misses ? stats.misses + ' пропусков (без удара)' : 'все доли') : 'Обнаружено пар'}</div>
     </div>
   `;
 }
@@ -1682,7 +1807,7 @@ function sessionToText(session) {
     text += `Попадания <20 мс: ${st.percentUnder20}%\n`;
     text += `Попадания <50 мс: ${st.percentUnder50}%\n`;
     text += `Уровень: ${st.level.label}\n`;
-    text += `Всего ударов: ${st.count}\n`;
+    text += `Ударов детектировано: ${st.count}${st.expectedBeats ? ' из ' + st.expectedBeats + ' долей' : ''}${st.misses ? ' (' + st.misses + ' пропусков)' : ''}\n`;
   }
   text += `\n--- ДЕТАЛИЗАЦИЯ ПО УДАРАМ ---\n`;
   text += `#  | Время(с) | Отклонение\n`;
@@ -1773,7 +1898,8 @@ function reportStatsHTML(st) {
     ['Попадания &lt;20 мс', `${st.percentUnder20}%`, `${Math.round(st.count * st.percentUnder20 / 100)} из ${st.count}`],
     ['Попадания &lt;50 мс', `${st.percentUnder50}%`, 'Хороший диапазон'],
     ['Диапазон', `${st.minAbs}–${st.maxAbs} мс`, 'Мин–макс |отклонения|'],
-    ['Всего ударов', `${st.count}`, 'Обнаружено пар'],
+    ['Ударов детектировано', `${st.count}${st.expectedBeats ? ' / ' + st.expectedBeats : ''}`,
+      st.expectedBeats ? (st.misses ? st.misses + ' пропусков (без удара)' : 'все доли') : 'Обнаружено пар'],
   ];
   return cards.map(([l, v, s]) => `
     <div class="rc">
