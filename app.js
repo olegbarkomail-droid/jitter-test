@@ -36,6 +36,11 @@ const state = {
   timerInterval: null,
   elapsed:       0,
   autoStopTimer: null,
+  // PCM-захват через AudioContext метронома (общие часы с эталонной сеткой)
+  recNodes:      null,   // { stream, source, processor, mute }
+  recChunks:     [],     // массив Float32Array кусков входного сигнала
+  recStartSec:   null,   // ctx.currentTime в момент первого куска (шкала сэмпла 0)
+  recSampleRate: null,   // частота дискретизации ctx
 };
 
 // ============================================================
@@ -314,6 +319,182 @@ function analyzeAudio(audioBuffer, config) {
   return results;
 }
 
+// ============================================================
+// 5b. АНАЛИЗ ПО ИЗВЕСТНОЙ СЕТКЕ МЕТРОНОМА (без калибровки порогов)
+// ============================================================
+//
+// ПОЧЕМУ ЭТО ЛУЧШЕ РУЧНЫХ ПОРОГОВ:
+// Метроном синтезируется приложением, а запись ведётся на ТОМ ЖЕ
+// AudioContext. Значит точное время каждого щелчка (metronome.clickTimes)
+// известно с сэмпловой точностью — метроном НЕ нужно «ловить» микрофоном
+// и подбирать порог. Остаётся единственная задача: найти удар палочки
+// рядом с каждой долей. Порог для палочки берём АВТОМАТИЧЕСКИ из уровня
+// шума. Пользователю ничего калибровать не нужно.
+
+/** Оценка уровня шума: устойчивый нижний перцентиль огибающей. */
+function estimateNoiseFloor(env) {
+  const N = env.length;
+  const step = Math.max(1, Math.floor(N / 20000));
+  const arr = [];
+  for (let i = 0; i < N; i += step) arr.push(env[i]);
+  arr.sort((a, b) => a - b);
+  return arr[Math.floor(arr.length * 0.4)] || 0; // ~медиана нижней части = фон
+}
+
+function median(arr) {
+  if (!arr.length) return 0;
+  const a = arr.slice().sort((x, y) => x - y);
+  const m = a.length >> 1;
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+function percentile(arr, p) {
+  if (!arr.length) return 0;
+  const a = arr.slice().sort((x, y) => x - y);
+  return a[Math.max(0, Math.min(a.length - 1, Math.floor(a.length * p)))];
+}
+
+/**
+ * alignComb — определяет АКУСТИЧЕСКУЮ ЗАДЕРЖКУ между эталонной сеткой
+ * (время планирования щелчка) и моментом, когда звук метронома реально
+ * слышен в микрофоне (динамик → воздух → микрофон).
+ *
+ * Метод — согласованная фильтрация «гребёнкой»: сдвигаем сетку на разные
+ * задержки и ищем ту, при которой сумма огибающей на узлах сетки максимальна.
+ * Именно там сидят щелчки метронома (самый громкий периодический сигнал).
+ * Это и есть реализация идеи «у метронома чёткая известная форма/время».
+ *
+ * @returns {{lag:number, conf:number}} lag в сэмплах, conf — уверенность
+ */
+function alignComb(env, sampleRate, metroSamples) {
+  if (!metroSamples || metroSamples.length === 0) return { lag: 0, conf: 0 };
+  const n = env.length;
+  const minLag = Math.round(-0.05 * sampleRate);
+  const maxLag = Math.round(0.45 * sampleRate);
+  const step   = Math.max(1, Math.round(0.0005 * sampleRate)); // ~0.5 мс
+
+  let bestLag = 0, bestScore = -1;
+  const scores = [];
+  for (let lag = minLag; lag <= maxLag; lag += step) {
+    let s = 0, c = 0;
+    for (let i = 0; i < metroSamples.length; i++) {
+      const idx = metroSamples[i] + lag;
+      if (idx >= 0 && idx < n) { s += env[idx]; c++; }
+    }
+    if (c === 0) continue;
+    const avg = s / c;
+    scores.push(avg);
+    if (avg > bestScore) { bestScore = avg; bestLag = lag; }
+  }
+  const med = median(scores);
+  const conf = med > 0 ? bestScore / med : 0;
+  return { lag: bestLag, conf };
+}
+
+/**
+ * analyzeAudioByGrid — ГЛАВНЫЙ анализ (по сетке метронома).
+ *
+ * @param {Float32Array} samples      — записанный PCM (моно)
+ * @param {number}       sampleRate   — частота дискретизации
+ * @param {Array<number>} metroSamples — индексы сэмплов запланированных щелчков
+ * @param {object}       config       — { SEARCH_WINDOW_MS, ... }
+ * @returns {Array<BeatResult>}
+ */
+function analyzeAudioByGrid(samples, sampleRate, metroSamples, config) {
+  const n = samples.length;
+  const smoothWin = Math.max(1, Math.round(sampleRate * 0.002)); // ~2 мс
+  const env = computeEnvelope(samples, smoothWin);
+
+  // Автопорог палочки из уровня шума (никакой ручной калибровки)
+  const noiseFloor = estimateNoiseFloor(env);
+  const gate = Math.max(noiseFloor * 3.5 + 0.002, 0.008);
+
+  // 1) Находим реальную позицию щелчков метронома в записи (акустическая задержка).
+  //    Если утечки метронома в микрофоне нет (например, наушники) — уверенность
+  //    низкая, и мы используем запланированное время как есть (lag = 0).
+  const { lag, conf } = alignComb(env, sampleRate, metroSamples);
+  const acoustic = conf >= 3.0;      // есть ли уверенно слышимая утечка метронома
+  const effLag   = acoustic ? lag : 0;
+
+  const gridPos = [];
+  for (const s of metroSamples) {
+    const i = s + effLag;
+    if (i >= 0 && i < n) gridPos.push(i);
+  }
+  if (gridPos.length === 0) return [];
+
+  const winSamples = Math.round((config.SEARCH_WINDOW_MS / 1000) * sampleRate);
+  const metroTol   = Math.round(0.022 * sampleRate); // ±22 мс — «зона» щелчка метронома
+
+  // Хелпер: лучший трансиент в диапазоне [lo,hi], ИСКЛЮЧАЯ зону метронома
+  function bestTransientOutside(g, lo, hi) {
+    let bestAmp = -1, bestIdx = -1, k = lo;
+    while (k <= hi) {
+      if (Math.abs(k - g) <= metroTol) { k = g + metroTol + 1; continue; }
+      if (env[k] > gate) {
+        let a = env[k], ai = k, j = k + 1;
+        while (j <= hi && Math.abs(j - g) > metroTol && env[j] > gate * 0.5) {
+          if (env[j] > a) { a = env[j]; ai = j; }
+          j++;
+        }
+        if (a > bestAmp) { bestAmp = a; bestIdx = ai; }
+        k = j;
+      } else k++;
+    }
+    return { amp: bestAmp, idx: bestIdx };
+  }
+
+  // 2) По каждой доле выбираем удар палочки.
+  //    Логика (амплитудная, без ручных порогов):
+  //      • Aoff — самый громкий трансиент ВНЕ зоны метронома (палочка мимо такта);
+  //      • Aon  — пик В зоне метронома (там палочка «легла» на щелчок или только щелчок).
+  //    Удар палочки — это самый громкий из них. Если громче внезонный пик —
+  //    палочка сыграна мимо; если пик на бите заметно выше уровня шума —
+  //    палочка попала точно в такт (её и берём, дав девиацию ≈ 0).
+  const results = [];
+  for (let b = 0; b < gridPos.length; b++) {
+    const g  = gridPos[b];
+    const lo = Math.max(0, g - winSamples);
+    const hi = Math.min(n - 1, g + winSamples);
+
+    // Пик ПРЯМО на бите (в зоне метронома)
+    let onAmp = -1, onIdx = -1;
+    const olo = Math.max(0, g - metroTol), ohi = Math.min(n - 1, g + metroTol);
+    for (let k = olo; k <= ohi; k++) if (env[k] > onAmp) { onAmp = env[k]; onIdx = k; }
+
+    // Лучший трансиент ВНЕ зоны метронома
+    const off = bestTransientOutside(g, lo, hi);
+
+    let stickIdx = -1, stickAmp = -1;
+    if (off.idx !== -1 && off.amp >= onAmp) {
+      // Чёткий удар мимо такта (громче, чем всё на бите)
+      stickIdx = off.idx; stickAmp = off.amp;
+    } else if (onAmp > gate * 1.5) {
+      // Есть заметная энергия на бите → палочка попала в такт
+      stickIdx = onIdx; stickAmp = onAmp;
+    } else if (off.idx !== -1) {
+      // Слабый, но реальный удар мимо такта
+      stickIdx = off.idx; stickAmp = off.amp;
+    }
+
+    if (stickIdx !== -1) {
+      const metroMs  = (g / sampleRate) * 1000;
+      const stickMs  = (stickIdx / sampleRate) * 1000;
+      const jitterMs = stickMs - metroMs; // <0 опережение, >0 запаздывание
+      results.push({
+        beatNum:            b + 1,
+        metronomeTimeMs:    Math.round(metroMs),
+        stickTimeMs:        Math.round(stickMs),
+        jitterMs:           Math.round(jitterMs),
+        metronomeAmplitude: +env[g].toFixed(3),
+        stickAmplitude:     +Math.max(0, stickAmp).toFixed(3),
+      });
+    }
+  }
+
+  return results;
+}
+
 /**
  * computeStats — вычисляет итоговую статистику по набору результатов.
  *
@@ -401,6 +582,8 @@ const metronome = {
   scheduleAhead: 0.10,   // с — горизонт планирования щелчков вперёд
   timerId:       null,
   volume:        0.9,    // громкость метронома (0–1)
+  clickTimes:    [],     // точное время каждого щелчка в часах AudioContext (сек) —
+                         // это ЭТАЛОННАЯ сетка: метроном не нужно «ловить» микрофоном
 };
 
 /** Создаёт (или возобновляет) AudioContext. Должно вызываться из жеста пользователя. */
@@ -429,6 +612,11 @@ function ensureAudioCtx() {
  */
 function scheduleClick(time) {
   const ctx = metronome.ctx;
+
+  // Запоминаем точное время щелчка — эталонная сетка для анализа.
+  // Так как запись ведётся на ЭТОМ ЖЕ AudioContext, это время идеально
+  // совпадает с временной шкалой записанного PCM (общие часы, без дрейфа).
+  metronome.clickTimes.push(time);
 
   // Общий выход щелчка с лёгким полосовым окрасом
   const master = ctx.createGain();
@@ -488,6 +676,7 @@ function startMetronome() {
   const ctx = ensureAudioCtx();
   metronome.isPlaying    = true;
   metronome.bpm          = state.config.BPM || 60;
+  metronome.clickTimes   = [];                     // сбрасываем эталонную сетку
   metronome.nextNoteTime = ctx.currentTime + 0.10; // небольшой запас на старт
   metronome.timerId      = setInterval(metronomeScheduler, metronome.lookahead);
   updateMetronomeUI(true);
@@ -937,34 +1126,39 @@ async function startRecording() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia(constraints);
 
-    // Выбираем лучший доступный формат записи
-    const mimeTypes = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/ogg;codecs=opus',
-      'audio/ogg',
-      '',
-    ];
-    const mimeType = mimeTypes.find(m => !m || MediaRecorder.isTypeSupported(m)) || '';
+    // ── PCM-захват через AudioContext МЕТРОНОМА ──────────────
+    // Ключевая идея: запись и метроном идут на ОДНИХ И ТЕХ ЖЕ часах
+    // AudioContext. Поэтому точное время щелчков (metronome.clickTimes)
+    // идеально совпадает со шкалой записанных сэмплов — метроном не нужно
+    // «ловить» микрофоном и подбирать порог. Он известен ТОЧНО.
+    const ctx = ensureAudioCtx();
+    state.recSampleRate = ctx.sampleRate;
+    state.recChunks     = [];
+    state.recStartSec   = null;
 
-    state.audioChunks  = [];
-    state.mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+    const source    = ctx.createMediaStreamSource(stream);
+    const processor = ctx.createScriptProcessor(4096, 1, 1);
+    const mute      = ctx.createGain();
+    mute.gain.value = 0; // выход глушим, чтобы не было петли/эха
 
-    state.mediaRecorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) state.audioChunks.push(e.data);
+    processor.onaudioprocess = (e) => {
+      const inp = e.inputBuffer.getChannelData(0);
+      // Время сэмпла 0 фиксируем на первом же куске (в часах ctx)
+      if (state.recStartSec === null) {
+        state.recStartSec = ctx.currentTime - inp.length / ctx.sampleRate;
+      }
+      state.recChunks.push(new Float32Array(inp)); // копия — буфер переиспользуется
     };
 
-    state.mediaRecorder.onstop = () => {
-      stream.getTracks().forEach(t => t.stop());
-      processRecording();
-    };
+    source.connect(processor);
+    processor.connect(mute);
+    mute.connect(ctx.destination);
 
-    // Собираем чанки каждые 100 мс для надёжности
-    state.mediaRecorder.start(100);
+    state.recNodes  = { stream, source, processor, mute };
     state.recording = true;
     state.elapsed   = 0;
 
-    // Запускаем метроном как эталонный сигнал — микрофон запишет его щелчки
+    // Запускаем метроном как эталонную сетку (общие часы с записью)
     startMetronome();
     lockBpmControls(true);
 
@@ -983,15 +1177,37 @@ async function startRecording() {
 }
 
 function stopRecording() {
-  if (!state.recording || !state.mediaRecorder) return;
+  if (!state.recording || !state.recNodes) return;
   clearTimeout(state.autoStopTimer);
   clearInterval(state.timerInterval);
+
+  // Фиксируем эталонную сетку ДО остановки метронома
+  const clickTimes = metronome.clickTimes.slice();
   stopMetronome();          // глушим эталонный метроном
   lockBpmControls(false);
-  state.mediaRecorder.stop();
+
+  // Разбираем аудиограф захвата
+  const { stream, source, processor, mute } = state.recNodes;
+  try { processor.onaudioprocess = null; } catch (_) {}
+  try { source.disconnect(); }    catch (_) {}
+  try { processor.disconnect(); } catch (_) {}
+  try { mute.disconnect(); }      catch (_) {}
+  try { stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+  state.recNodes  = null;
   state.recording = false;
   updateRecordUI(false);
   el('record-status').textContent = 'Анализ записи…';
+
+  // Склеиваем PCM-куски в единый Float32Array
+  const chunks = state.recChunks;
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const pcm = new Float32Array(total);
+  let off = 0;
+  for (const c of chunks) { pcm.set(c, off); off += c.length; }
+  state.recChunks = [];
+
+  processRecording(pcm, state.recSampleRate, clickTimes, state.recStartSec);
 }
 
 /** Блокирует смену темпа/метронома во время записи (эталон нельзя менять на ходу). */
@@ -1003,42 +1219,41 @@ function lockBpmControls(locked) {
   if (!locked) updateBpmUI(); // вернуть корректное состояние границ 30/120
 }
 
-async function processRecording() {
-  el('record-status').textContent = 'Декодирование аудио…';
+function processRecording(pcm, sampleRate, clickTimes, recStartSec) {
+  el('record-status').textContent = 'Анализ записи…';
 
   try {
-    const mimeType = state.mediaRecorder.mimeType || 'audio/webm';
-    const blob = new Blob(state.audioChunks, { type: mimeType });
-
-    if (blob.size < 1000) {
+    if (!pcm || pcm.length < sampleRate * 2) {
       toast('Запись слишком короткая или пустая', 'error');
       el('record-status').textContent = 'Готов к записи';
       return;
     }
 
-    const arrayBuffer = await blob.arrayBuffer();
+    // Переводим эталонное время щелчков в индексы сэмплов записи.
+    // Общие часы AudioContext → привязка точная, без дрейфа.
+    const metroSamples = [];
+    if (clickTimes && recStartSec != null) {
+      for (const t of clickTimes) {
+        const idx = Math.round((t - recStartSec) * sampleRate);
+        if (idx >= 0 && idx < pcm.length) metroSamples.push(idx);
+      }
+    }
 
-    const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    const audioCtx = new AudioCtx();
-
-    el('record-status').textContent = 'Поиск пиков…';
-
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-    await audioCtx.close();
-
-    // Темп известен → задаём мин. расстояние между щелчками метронома как
-    // ~55% интервала доли. Это отсекает эхо/двойные срабатывания, но не
-    // теряет реальные удары (интервал доли при 30–120 BPM = 2000–500 мс).
-    const beatMs = 60000 / (state.config.BPM || 60);
-    const analysisConfig = {
-      ...state.config,
-      MIN_PEAK_DISTANCE_MS: Math.round(beatMs * 0.55),
-    };
-
-    const results = analyzeAudio(audioBuffer, analysisConfig);
+    let results;
+    if (metroSamples.length >= 3) {
+      // ОСНОВНОЙ путь: анализ по известной сетке метронома (без калибровки)
+      results = analyzeAudioByGrid(pcm, sampleRate, metroSamples, state.config);
+    } else {
+      // Резерв: сетки нет (метроном не играл) — старый амплитудный метод
+      const beatMs = 60000 / (state.config.BPM || 60);
+      results = analyzeAudio(
+        { sampleRate, getChannelData: () => pcm },
+        { ...state.config, MIN_PEAK_DISTANCE_MS: Math.round(beatMs * 0.55) },
+      );
+    }
 
     if (results.length === 0) {
-      toast('Удары не обнаружены. Снизьте порог метронома или проверьте микрофон.', 'error');
+      toast('Удары палочкой не обнаружены. Проверьте, что микрофон слышит удары.', 'error');
       el('record-status').textContent = 'Готов к записи';
       return;
     }
@@ -2003,11 +2218,14 @@ document.addEventListener('DOMContentLoaded', () => {
   el('bpm-minus').addEventListener('click', () => changeBpm(-BPM_STEP));
   el('bpm-plus').addEventListener('click',  () => changeBpm(+BPM_STEP));
 
-  // ── Калибровка порогов ──
-  initCalibDrag();
-  syncCalibHandles();
-  el('calib-btn').addEventListener('click', toggleCalibration);
-  el('calib-auto-btn').addEventListener('click', startAutoCalibration);
+  // ── Калибровка порогов (устаревший блок — оставлен для совместимости) ──
+  // Анализ теперь идёт по известной сетке метронома, ручная калибровка не нужна.
+  if (el('calib-btn')) {
+    initCalibDrag();
+    syncCalibHandles();
+    el('calib-btn').addEventListener('click', toggleCalibration);
+    el('calib-auto-btn').addEventListener('click', startAutoCalibration);
+  }
 
   // ── Сохранить как ДО / ПОСЛЕ ──
   el('save-before-btn').addEventListener('click', () => {
